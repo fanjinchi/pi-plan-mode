@@ -1,6 +1,6 @@
 # 🧭 pi-plan-mode — Codex-like Plan Mode for Pi
 
-[![npm](https://img.shields.io/npm/v/@fanjinchi/pi-plan-mode)](https://www.npmjs.com/package/@fanjinchi/pi-plan-mode) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
+[![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
 `@fanjinchi/pi-plan-mode` adds a Codex-like `/plan` collaboration mode to Pi. Plan mode is for read-only exploration, clarifying questions, and a final implementation-ready `<proposed_plan>` block before any code mutation happens.
 
@@ -29,17 +29,19 @@ Pi core intentionally does not ship a built-in plan mode; this package provides 
 
 ## 📦 Install
 
+This package is not published to npm. Install it from the GitHub repository instead:
+
 ```bash
-pi install npm:@fanjinchi/pi-plan-mode
+pi install git:github.com/fanjinchi/pi-plan-mode
 ```
 
 Try without installing permanently:
 
 ```bash
-pi -e npm:@fanjinchi/pi-plan-mode
+pi -e git:github.com/fanjinchi/pi-plan-mode
 ```
 
-Try this package locally:
+Or try this package locally:
 
 ```bash
 pi -e .
