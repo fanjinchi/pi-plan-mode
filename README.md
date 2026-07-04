@@ -16,6 +16,7 @@ Pi core intentionally does not ship a built-in plan mode; this package provides 
 - Injects Codex-like Plan mode instructions: explore first, ask decision questions for high-impact ambiguity, do not mutate files, and finish with `<proposed_plan>` only when decision-complete.
 - Adds a required `plan_mode_question` tool so the agent can ask structured Plan-mode questions before finalizing a plan.
 - Detects proposed plan blocks and prompts you to implement, stay in Plan mode, or exit and discard the plan.
+- When you choose to implement, an optional input dialog lets you attach extra implementation instructions before Plan mode is disabled and the plan is handed off.
 - Shows Plan mode state in Pi's statusline as `plan active` or `plan ready`; `@narumitw/pi-statusline` adds the default `📝` icon unless configured otherwise.
 - Persists Plan mode state in the Pi session so resume restores the mode.
 
@@ -83,7 +84,7 @@ A complete Plan mode answer should appear only after the agent has resolved disc
 </proposed_plan>
 ```
 
-After a proposed plan is detected, `/plan` lets you choose whether to implement the plan, stay in Plan mode, or exit Plan mode. Choosing implementation disables Plan mode, restores full tool access, and immediately starts an implementation turn with the proposed plan. Choosing Stay keeps the plan ready while you decide what to do next; to revise the plan, choose Stay and type your revision feedback in the normal prompt. When that next Plan-mode turn starts, the previous plan is no longer treated as the latest implementable plan unless the agent produces an updated `<proposed_plan>`. Choosing exit/off disables Plan mode and discards the proposed plan so it is not carried into later non-plan turns.
+After a proposed plan is detected, `/plan` lets you choose whether to implement the plan, stay in Plan mode, or exit Plan mode. Choosing implementation opens an optional input dialog where you can add extra instructions; leaving it blank proceeds with the proposed plan as-is. Once confirmed, Plan mode is disabled, full tool access is restored, and an implementation turn starts with the proposed plan and any extra instructions you provided. Choosing Stay keeps the plan ready while you decide what to do next; to revise the plan, choose Stay and type your revision feedback in the normal prompt. When that next Plan-mode turn starts, the previous plan is no longer treated as the latest implementable plan unless the agent produces an updated `<proposed_plan>`. Choosing exit/off disables Plan mode and discards the proposed plan so it is not carried into later non-plan turns.
 
 While Plan mode is enabled, the extension also publishes a compact status for Pi statuslines. With `@narumitw/pi-statusline`, this appears in the extension status area:
 

@@ -5,6 +5,7 @@ __MACOSX/
 .AppleDouble
 .LSOverride
 Icon?
+.codegraph/
 
 # Resource forks
 ._*

@@ -394,7 +394,7 @@ export default function planMode(pi: ExtensionAPI) {
 		}, 0);
 	}
 
-	function startImplementation(ctx: ExtensionContext) {
+	function startImplementation(ctx: ExtensionContext, extraInput?: string) {
 		const plan = state.latestPlan?.trim();
 		exitPlanMode(ctx);
 
@@ -403,10 +403,27 @@ export default function planMode(pi: ExtensionAPI) {
 			return;
 		}
 
+		const extra = extraInput ? `\n\nAdditional instructions from user:\n${extraInput}` : "";
 		sendPlanModeUserMessage(
-			`Plan mode is now disabled. Full tool access is restored. Implement this proposed plan now:\n\n${plan}`,
+			`Plan mode is now disabled. Full tool access is restored. Implement this proposed plan now:\n\n${plan}${extra}`,
 			ctx,
 		);
+	}
+
+	async function confirmStartImplementation(ctx: ExtensionContext): Promise<boolean> {
+		if (!ctx.hasUI) {
+			startImplementation(ctx);
+			return true;
+		}
+
+		const extraInput = await ctx.ui.editor(
+			"Add any extra implementation instructions (optional). Leave blank to proceed with the plan as-is.",
+			"",
+		);
+		if (extraInput === undefined) return false;
+
+		startImplementation(ctx, extraInput.trim());
+		return true;
 	}
 
 	async function showPlanMenu(ctx: ExtensionContext) {
@@ -430,7 +447,8 @@ export default function planMode(pi: ExtensionAPI) {
 			return;
 		}
 		if (choice === "Implement this plan") {
-			startImplementation(ctx);
+			const proceeded = await confirmStartImplementation(ctx);
+			if (!proceeded) await showPlanMenu(ctx);
 			return;
 		}
 		if (choice === "Configure Plan-mode tools") {
@@ -452,7 +470,8 @@ export default function planMode(pi: ExtensionAPI) {
 			"Exit Plan mode",
 		]);
 		if (choice === "Implement this plan") {
-			startImplementation(ctx);
+			const proceeded = await confirmStartImplementation(ctx);
+			if (!proceeded) await showPlanReadyMenu(ctx);
 			return;
 		}
 		if (choice === "Exit Plan mode") {

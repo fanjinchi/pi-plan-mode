@@ -12,7 +12,7 @@ import planMode, {
 	withoutPlanModeQuestionTool,
 	withRequiredPlanModeTools,
 } from "../src/plan-mode.js";
-import { builtinTool, createMockPi, extensionTool } from "./support.js";
+import { builtinTool, createMockContext, createMockPi, extensionTool } from "./support.js";
 
 test("plan-mode registers flag, question tool, command, and safety hooks", () => {
 	const mock = createMockPi({ activeTools: ["read", "bash"] });
@@ -100,4 +100,111 @@ test("proposed-plan helpers extract and remove plan blocks", () => {
 		]),
 		"answer",
 	);
+});
+
+test("Implement this plan appends user extra input from ready menu", async () => {
+	const mock = createMockPi({ activeTools: ["read", "bash"] });
+	planMode(mock.pi);
+
+	let selectCalls = 0;
+	const selectValues = ["Implement this plan"];
+	const { ctx } = createMockContext({
+		hasUI: true,
+		select: async () => selectValues[selectCalls++] ?? undefined,
+		editor: async () => "Also add tests",
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	const agentEndHandlers = mock.events.get("agent_end") ?? [];
+	for (const handler of agentEndHandlers) {
+		await handler(
+			{
+				messages: [
+					{
+						message: {
+							role: "assistant",
+							content: [
+								{
+									type: "text",
+									text: "Plan:\n<proposed_plan>\n# Fix bug\n</proposed_plan>",
+								},
+							],
+						},
+					},
+				],
+			},
+			ctx,
+		);
+	}
+
+	await new Promise((resolve) => setTimeout(resolve, 10));
+
+	assert.equal(mock.sentUserMessages.length, 1);
+	const sent = mock.sentUserMessages[0]?.text ?? "";
+	assert.ok(sent.includes("Implement this proposed plan now"));
+	assert.ok(sent.includes("Additional instructions from user:\nAlso add tests"));
+	assert.ok(sent.includes("# Fix bug"));
+});
+
+test("Cancelling implementation input returns to ready menu", async () => {
+	const mock = createMockPi({ activeTools: ["read", "bash"] });
+	planMode(mock.pi);
+
+	let selectCalls = 0;
+	const selectValues = ["Implement this plan", "Exit Plan mode"];
+	const { ctx } = createMockContext({
+		hasUI: true,
+		select: async () => selectValues[selectCalls++] ?? undefined,
+		editor: async () => undefined,
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	const agentEndHandlers = mock.events.get("agent_end") ?? [];
+	for (const handler of agentEndHandlers) {
+		await handler(
+			{
+				messages: [
+					{
+						message: {
+							role: "assistant",
+							content: [
+								{
+									type: "text",
+									text: "Plan:\n<proposed_plan>\n# Fix bug\n</proposed_plan>",
+								},
+							],
+						},
+					},
+				],
+			},
+			ctx,
+		);
+	}
+
+	await new Promise((resolve) => setTimeout(resolve, 10));
+
+	assert.equal(selectCalls, 2);
+	assert.equal(mock.sentUserMessages.length, 0);
 });
