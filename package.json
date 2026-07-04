@@ -37,6 +37,10 @@
 	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/narumiruna/pi-plan-mode"
-	}
+		"url": "https://github.com/fanjinchi/pi-plan-mode"
+	},
+	"bugs": {
+		"url": "https://github.com/fanjinchi/pi-plan-mode/issues"
+	},
+	"homepage": "https://github.com/fanjinchi/pi-plan-mode#readme"
 }
