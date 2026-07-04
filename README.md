@@ -6,6 +6,13 @@
 
 Pi core intentionally does not ship a built-in plan mode; this package provides one as an independently installable extension.
 
+> **Modified from `@narumitw/pi-plan-mode`**
+>
+> This package is forked from `@narumitw/pi-plan-mode` with the following changes:
+>
+> - When choosing **Implement this plan**, an optional input dialog now lets you attach extra implementation instructions. The instructions are appended to the hand-off message that starts the implementation turn.
+> - Cancelling the input dialog returns you to the previous menu instead of exiting Plan mode.
+
 ## ✨ Features
 
 - Adds `/plan` to enter or manage Plan mode.
