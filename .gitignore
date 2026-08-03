@@ -134,3 +134,4 @@ vite.config.ts.timestamp-*
 
 # Test cache
 node_modules/.cache/
+.pi-subagents/
