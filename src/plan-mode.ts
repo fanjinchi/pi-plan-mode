@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
 
 const STATE_ENTRY_TYPE = "plan-mode-state";
@@ -11,8 +13,7 @@ const SAFE_BUILTIN_PLAN_TOOLS = new Set(["read", "bash", "grep", "find", "ls"]);
 const BLOCKED_BUILTIN_TOOLS = new Set(["edit", "write"]);
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
 const TOOL_SELECTOR_PAGE_SIZE = 10;
-const PROPOSED_PLAN_PATTERN = /<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i;
-const PROPOSED_PLAN_BLOCK_PATTERN = /<proposed_plan>\s*[\s\S]*?\s*<\/proposed_plan>/gi;
+const PLAN_FILE_NAME = "pi_plan.md";
 
 interface CommandArgumentCompletion {
 	value: string;
@@ -32,17 +33,6 @@ type SessionEntry = {
 	type?: string;
 	customType?: string;
 	data?: Partial<PlanModeState>;
-	message?: SessionMessage;
-};
-
-type SessionMessage = {
-	role?: string;
-	content?: unknown;
-};
-
-type TextBlock = {
-	type?: string;
-	text?: string;
 };
 
 type PlanModeQuestionOption = {
@@ -246,7 +236,7 @@ export default function planMode(pi: ExtensionAPI) {
 			const command = prompt.toLowerCase();
 			if (command === "exit" || command === "off") {
 				exitPlanMode(ctx);
-				ctx.ui.notify("Plan mode disabled. Proposed plan discarded.", "info");
+				ctx.ui.notify(`Plan mode disabled. ${PLAN_FILE_NAME} kept on disk.`, "info");
 				return;
 			}
 			if (command === "tools") {
@@ -260,7 +250,10 @@ export default function planMode(pi: ExtensionAPI) {
 			}
 			if (!state.enabled) {
 				enterPlanMode(ctx);
-				ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+				ctx.ui.notify(
+					`Plan mode enabled. I will explore and write the plan to ${PLAN_FILE_NAME}, but not modify project files.`,
+					"info",
+				);
 				return;
 			}
 			await showPlanMenu(ctx);
@@ -270,8 +263,10 @@ export default function planMode(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		restoreState(ctx);
 		if (pi.getFlag("plan") === true) state.enabled = true;
-		if (state.enabled) activatePlanModeTools();
-		else deactivatePlanModeQuestionTool();
+		if (state.enabled) {
+			activatePlanModeTools();
+			syncPlanFromFile(ctx);
+		} else deactivatePlanModeQuestionTool();
 		updateUi(ctx);
 	});
 
@@ -280,12 +275,13 @@ export default function planMode(pi: ExtensionAPI) {
 		clearUi(ctx);
 	});
 
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (!state.enabled) return;
 		if (isBlockedBuiltinToolName(event.toolName)) {
+			if (isPlanFileTarget(ctx.cwd, event.input)) return;
 			return {
 				block: true,
-				reason: `Plan mode blocks built-in mutating tool '${event.toolName}'. Use /plan and choose implementation when the plan is ready.`,
+				reason: `Plan mode only allows writing to ${PLAN_FILE_NAME} in the working directory. Use /plan and choose implementation when the plan is ready.`,
 			};
 		}
 		if (event.toolName !== "bash" || !isBuiltinToolName(event.toolName)) return;
@@ -305,49 +301,45 @@ export default function planMode(pi: ExtensionAPI) {
 		);
 		if (state.enabled) return { messages: messagesWithoutLegacyPlanContext };
 		return {
-			messages: messagesWithoutLegacyPlanContext
-				.filter((message: unknown) => !messageContainsInactivePlanModeArtifact(message))
-				.map(stripProposedPlanBlocksFromMessage),
+			messages: messagesWithoutLegacyPlanContext.filter(
+				(message: unknown) => !messageContainsInactivePlanModeArtifact(message),
+			),
 		};
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
 		if (!state.enabled) return;
-		if (state.latestPlan || state.awaitingAction) {
-			state = { ...state, latestPlan: undefined, awaitingAction: false };
-			persistState();
-			updateUi(ctx);
-		}
+		syncPlanFromFile(ctx);
 		applyPlanModeTools();
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${buildPlanModePrompt()}`,
 		};
 	});
 
-	pi.on("agent_end", async (event, ctx) => {
+	pi.on("agent_end", async (_event, ctx) => {
 		if (!state.enabled) return;
 
-		const text = latestAssistantText(event.messages);
-		const proposedPlan = extractProposedPlan(text);
-		if (!proposedPlan) {
-			persistState();
-			updateUi(ctx);
-			return;
+		const previous = state.latestPlan;
+		const plan = readPlanFile(ctx.cwd);
+		if (plan) {
+			state = { ...state, latestPlan: plan, awaitingAction: true };
+		} else {
+			state = { ...state, latestPlan: undefined, awaitingAction: false };
 		}
-
-		state = { ...state, latestPlan: proposedPlan, awaitingAction: true };
 		persistState();
 		updateUi(ctx);
 
+		if (!plan || plan === previous) return;
+
 		scheduleAfterCurrentAgentRun(async () => {
-			if (!state.enabled || state.latestPlan !== proposedPlan) return;
+			if (!state.enabled || state.latestPlan !== plan) return;
 			if (ctx.hasUI) await showPlanReadyMenu(ctx);
-			if (!state.enabled || state.latestPlan !== proposedPlan) return;
+			if (!state.enabled || state.latestPlan !== plan) return;
 
 			pi.sendMessage(
 				{
 					customType: PROPOSED_PLAN_MESSAGE_TYPE,
-					content: `**Proposed Plan**\n\n${proposedPlan}`,
+					content: `**Proposed Plan**\n\n${plan}`,
 					display: true,
 				},
 				{ triggerTurn: false },
@@ -367,7 +359,10 @@ export default function planMode(pi: ExtensionAPI) {
 		const wasEnabled = state.enabled;
 		enterPlanMode(ctx);
 		if (!wasEnabled) {
-			ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+			ctx.ui.notify(
+				`Plan mode enabled. I will explore and write the plan to ${PLAN_FILE_NAME}, but not modify project files.`,
+				"info",
+			);
 		}
 		sendPlanModeUserMessage(prompt, ctx);
 	}
@@ -395,7 +390,7 @@ export default function planMode(pi: ExtensionAPI) {
 	}
 
 	function startImplementation(ctx: ExtensionContext, extraInput?: string) {
-		const plan = state.latestPlan?.trim();
+		const plan = readPlanFile(ctx.cwd) ?? state.latestPlan?.trim();
 		exitPlanMode(ctx);
 
 		if (!plan) {
@@ -427,6 +422,7 @@ export default function planMode(pi: ExtensionAPI) {
 	}
 
 	async function showPlanMenu(ctx: ExtensionContext) {
+		syncPlanFromFile(ctx);
 		if (!ctx.hasUI) {
 			ctx.ui.notify(planStatusText(), "info");
 			return;
@@ -457,7 +453,7 @@ export default function planMode(pi: ExtensionAPI) {
 		}
 		if (choice === "Exit Plan mode") {
 			exitPlanMode(ctx);
-			ctx.ui.notify("Plan mode disabled. Proposed plan discarded.", "info");
+			ctx.ui.notify(`Plan mode disabled. ${PLAN_FILE_NAME} kept on disk.`, "info");
 			return;
 		}
 		updateUi(ctx);
@@ -476,7 +472,7 @@ export default function planMode(pi: ExtensionAPI) {
 		}
 		if (choice === "Exit Plan mode") {
 			exitPlanMode(ctx);
-			ctx.ui.notify("Plan mode disabled. Proposed plan discarded.", "info");
+			ctx.ui.notify(`Plan mode disabled. ${PLAN_FILE_NAME} kept on disk.`, "info");
 		}
 	}
 
@@ -556,7 +552,7 @@ export default function planMode(pi: ExtensionAPI) {
 
 	function planModeToolNames() {
 		const tools = selectableTools();
-		if (tools.length === 0) return ["read", "bash", PLAN_MODE_QUESTION_TOOL_NAME];
+		if (tools.length === 0) return ["read", "bash", "edit", "write", PLAN_MODE_QUESTION_TOOL_NAME];
 
 		const selectedNames = planModeSelectedNames(tools);
 		return withRequiredPlanModeTools(
@@ -658,6 +654,15 @@ export default function planMode(pi: ExtensionAPI) {
 		};
 	}
 
+	function syncPlanFromFile(ctx: ExtensionContext) {
+		const plan = readPlanFile(ctx.cwd);
+		if (plan !== state.latestPlan) {
+			state = { ...state, latestPlan: plan, awaitingAction: !!plan };
+			persistState();
+			updateUi(ctx);
+		}
+	}
+
 	function updateUi(ctx: ExtensionContext) {
 		ctx.ui.setStatus(STATUS_KEY, formatStatus());
 		if (state.enabled && state.latestPlan) {
@@ -669,7 +674,7 @@ export default function planMode(pi: ExtensionAPI) {
 			ctx.ui.setWidget(PLAN_WIDGET_KEY, [
 				"Plan mode: planning",
 				formatToolSummary(),
-				"Produce a <proposed_plan> block.",
+				`Write the plan to ${PLAN_FILE_NAME}.`,
 			]);
 		} else {
 			ctx.ui.setWidget(PLAN_WIDGET_KEY, undefined);
@@ -691,7 +696,7 @@ export default function planMode(pi: ExtensionAPI) {
 		if (!state.enabled) return "Plan mode is off.";
 		if (state.latestPlan)
 			return `Plan mode is active and a proposed plan is ready. ${formatToolSummary()}`;
-		return `Plan mode is active. ${formatToolSummary()} Explore, ask, and produce a <proposed_plan> block.`;
+		return `Plan mode is active. ${formatToolSummary()} Explore, ask, and write the plan to ${PLAN_FILE_NAME}.`;
 	}
 
 	function formatToolSummary() {
@@ -754,7 +759,10 @@ function formatToolChoice(tool: ToolInfo, selected: boolean, index: number) {
 
 function toolPolicyLabel(tool: ToolInfo) {
 	if (isBuiltinTool(tool)) {
-		if (!SAFE_BUILTIN_PLAN_TOOLS.has(tool.name)) return "built-in blocked";
+		if (!SAFE_BUILTIN_PLAN_TOOLS.has(tool.name)) {
+			if (tool.name === "edit" || tool.name === "write") return "built-in plan-file only";
+			return "built-in blocked";
+		}
 		return tool.name === "bash" ? "built-in limited" : "built-in";
 	}
 	return `user risk: ${toolSourceLabel(tool)}`;
@@ -771,7 +779,12 @@ function unique(values: string[]) {
 }
 
 export function withRequiredPlanModeTools(toolNames: string[]) {
-	return unique([...withoutPlanModeQuestionTool(toolNames), PLAN_MODE_QUESTION_TOOL_NAME]);
+	return unique([
+		...withoutPlanModeQuestionTool(toolNames),
+		"edit",
+		"write",
+		PLAN_MODE_QUESTION_TOOL_NAME,
+	]);
 }
 
 export function withoutPlanModeQuestionTool(toolNames: string[]) {
@@ -795,7 +808,10 @@ export function normalizePlanModeQuestionParams(
 	const questions: PlanModeQuestion[] = [];
 	for (const [questionIndex, rawQuestion] of input.questions.entries()) {
 		if (!isRecord(rawQuestion)) {
-			return { ok: false, error: `question ${questionIndex + 1} must be an object` };
+			return {
+				ok: false,
+				error: `question ${questionIndex + 1} must be an object`,
+			};
 		}
 
 		const id = stringField(rawQuestion.id);
@@ -812,7 +828,10 @@ export function normalizePlanModeQuestionParams(
 			return { ok: false, error: `question ${questionIndex + 1} options must be an array` };
 		}
 		if (rawQuestion.options.length < 2 || rawQuestion.options.length > 4) {
-			return { ok: false, error: `question ${questionIndex + 1} options must contain 2-4 items` };
+			return {
+				ok: false,
+				error: `question ${questionIndex + 1} options must contain 2-4 items`,
+			};
 		}
 
 		const options: PlanModeQuestionOption[] = [];
@@ -840,7 +859,6 @@ export function normalizePlanModeQuestionParams(
 			}
 			options.push({ label, description });
 		}
-
 		questions.push({ id, header, question, options });
 	}
 
@@ -947,10 +965,11 @@ You are in Plan Mode, a Codex-like collaboration mode for producing a decision-c
 ## Mode rules
 
 - Stay in Plan Mode until a developer or extension explicitly exits it.
-- Treat requests to implement as requests to plan the implementation; do not edit files or carry out the plan.
+- Treat requests to implement as requests to plan the implementation; do not edit project files or carry out the plan.
 - Do not use update_plan/TODO tooling in Plan Mode; Plan Mode is conversational planning, not execution progress tracking.
 - Plan Mode manages built-in tool safety only. Non-built-in tools are disabled by default and may be enabled by the user at their own risk.
-- Do not perform mutating actions: no edit/write tools, no patching, no formatting that rewrites files, no dependency installation, no commits, no migrations.
+- Do not perform mutating actions on project files: no patching, no formatting that rewrites files, no dependency installation, no commits, no migrations.
+- The only writable file in Plan Mode is \`${PLAN_FILE_NAME}\` in the working directory. Use it as the plan document: create it with \`write\` or update it with \`edit\`.
 
 ## Phase 1 — Ground in the environment
 
@@ -971,25 +990,19 @@ You are in Plan Mode, a Codex-like collaboration mode for producing a decision-c
 
 ## Finalization rule
 
-Only output the final plan when it is decision-complete and leaves no decisions to the implementer. When presenting the official plan, output exactly one proposed plan block and keep the tags exactly as shown:
+Only write the final plan when it is decision-complete and leaves no decisions to the implementer. Write the complete plan to \`${PLAN_FILE_NAME}\` (use \`write\` to create/rewrite, \`edit\` for targeted updates) with this structure:
 
-<proposed_plan>
-# Title
+- # Title
+- ## Summary
+- ## Key Changes
+- ## Test Plan
+- ## Assumptions
 
-## Summary
-...
+After writing the plan, reply with only a brief chat summary; do not paste the full plan back into the chat. Do not ask "should I proceed?" — the Plan-mode ready menu handles next steps.
 
-## Key Changes
-...
+## Revision rule
 
-## Test Plan
-...
-
-## Assumptions
-...
-</proposed_plan>
-
-Keep the proposed plan concise, human and agent digestible, and free of open decisions. Do not ask "should I proceed?" in the final output; the Plan-mode ready menu handles implementation, staying in Plan mode, or exit.`;
+When the user gives feedback on an existing plan, ask clarifying questions first if high-impact ambiguity remains. Otherwise update \`${PLAN_FILE_NAME}\` so it always reflects the latest agreed plan.`;
 }
 
 function readCommand(input: unknown) {
@@ -1004,20 +1017,30 @@ export function isSafeCommand(command: string) {
 	return SAFE_BASH_PATTERNS.some((pattern) => pattern.test(trimmed));
 }
 
-export function extractProposedPlan(text: string) {
-	const match = PROPOSED_PLAN_PATTERN.exec(text);
-	return match?.[1]?.trim();
+export function planFilePath(cwd: string): string {
+	return path.join(cwd, PLAN_FILE_NAME);
 }
 
-export function latestAssistantText(messages: unknown) {
-	if (!Array.isArray(messages)) return "";
-	for (const entry of [...messages].reverse()) {
-		const message = (entry as { message?: SessionMessage })?.message ?? (entry as SessionMessage);
-		if (message?.role !== "assistant") continue;
-		const text = messageText(message);
-		if (text) return text;
+export function readPlanFile(cwd: string): string | undefined {
+	try {
+		const content = fs.readFileSync(planFilePath(cwd), "utf-8").trim();
+		return content || undefined;
+	} catch {
+		return undefined;
 	}
-	return "";
+}
+
+export function isPlanFileTarget(cwd: string, input: unknown): boolean {
+	if (!isRecord(input)) return false;
+	const p = input.path;
+	if (typeof p !== "string") return false;
+	if (path.resolve(cwd, p) !== path.resolve(cwd, PLAN_FILE_NAME)) return false;
+	try {
+		// Refuse to write through a symlinked plan file; a missing file is fine (creation).
+		return !fs.lstatSync(planFilePath(cwd)).isSymbolicLink();
+	} catch {
+		return true;
+	}
 }
 
 function messageContainsLegacyPlanModeContextArtifact(message: unknown) {
@@ -1030,62 +1053,7 @@ function messageContainsInactivePlanModeArtifact(message: unknown) {
 	return candidate.customType === PROPOSED_PLAN_MESSAGE_TYPE;
 }
 
-export function stripProposedPlanBlocksFromMessage<T>(message: T): T {
-	const candidate = unwrapSessionMessage(message);
-	if (candidate.role !== "assistant") return message;
-
-	const content = stripProposedPlanBlocksFromContent(candidate.content);
-	if (content === candidate.content) return message;
-
-	if (isSessionMessageEntry(message)) {
-		return { ...message, message: { ...candidate, content } };
-	}
-	return { ...candidate, content } as T;
-}
-
 function unwrapSessionMessage(message: unknown) {
 	const entry = message as { message?: unknown };
 	return (entry.message ?? message) as { role?: string; customType?: string; content?: unknown };
-}
-
-function isSessionMessageEntry<T>(message: T): message is T & { message: SessionMessage } {
-	return typeof message === "object" && message !== null && "message" in message;
-}
-
-function stripProposedPlanBlocksFromContent(content: unknown) {
-	if (typeof content === "string") return stripProposedPlanBlocks(content);
-	if (!Array.isArray(content)) return content;
-
-	let changed = false;
-	const nextContent = content.map((block) => {
-		const textBlock = block as TextBlock;
-		if (textBlock.type !== "text" || typeof textBlock.text !== "string") return block;
-
-		const text = stripProposedPlanBlocks(textBlock.text);
-		if (text === textBlock.text) return block;
-
-		changed = true;
-		return { ...textBlock, text };
-	});
-	return changed ? nextContent : content;
-}
-
-export function stripProposedPlanBlocks(text: string) {
-	return text.replace(PROPOSED_PLAN_BLOCK_PATTERN, "");
-}
-
-function messageText(message: SessionMessage) {
-	return contentText(message.content);
-}
-
-function contentText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((block) => {
-			const textBlock = block as TextBlock;
-			return textBlock.type === "text" && typeof textBlock.text === "string" ? textBlock.text : "";
-		})
-		.filter(Boolean)
-		.join("\n");
 }

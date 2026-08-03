@@ -68,7 +68,7 @@ export function createMockPi(options: { activeTools?: string[]; allTools?: unkno
 			activeTools = [...names];
 		},
 		getAllTools() {
-			return allTools;
+			return [...allTools];
 		},
 		getThinkingLevel() {
 			return "off";

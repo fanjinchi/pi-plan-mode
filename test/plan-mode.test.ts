@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import planMode, {
 	canSelectToolInPlanMode,
 	completePlanArguments,
-	extractProposedPlan,
+	isPlanFileTarget,
 	isSafeCommand,
-	latestAssistantText,
 	normalizePlanModeQuestionParams,
-	stripProposedPlanBlocks,
-	stripProposedPlanBlocksFromMessage,
+	readPlanFile,
 	withoutPlanModeQuestionTool,
 	withRequiredPlanModeTools,
 } from "../src/plan-mode.js";
@@ -47,6 +48,8 @@ test("tool selection allows safe built-ins and non-built-ins only", () => {
 	assert.equal(canSelectToolInPlanMode(extensionTool("custom") as PlanTool), true);
 	assert.deepEqual(withRequiredPlanModeTools(["read", "plan_mode_question", "read"]), [
 		"read",
+		"edit",
+		"write",
 		"plan_mode_question",
 	]);
 	assert.deepEqual(withoutPlanModeQuestionTool(["read", "plan_mode_question"]), ["read"]);
@@ -83,32 +86,122 @@ test("normalizePlanModeQuestionParams validates question shape", () => {
 	});
 });
 
-test("proposed-plan helpers extract and remove plan blocks", () => {
-	assert.equal(extractProposedPlan("Intro\n<proposed_plan>\n# Plan\n</proposed_plan>"), "# Plan");
-	assert.equal(stripProposedPlanBlocks("A<proposed_plan>secret</proposed_plan>B"), "AB");
-	assert.deepEqual(
-		stripProposedPlanBlocksFromMessage({
-			role: "assistant",
-			content: [{ type: "text", text: "Keep\n<proposed_plan>remove</proposed_plan>" }],
-		}),
-		{ role: "assistant", content: [{ type: "text", text: "Keep\n" }] },
-	);
-	assert.equal(
-		latestAssistantText([
-			{ role: "user", content: "ignore" },
-			{ message: { role: "assistant", content: [{ type: "text", text: "answer" }] } },
-		]),
-		"answer",
-	);
+test("readPlanFile returns trimmed content or undefined", (t) => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+	const planPath = path.join(tmpDir, "pi_plan.md");
+
+	assert.equal(readPlanFile(tmpDir), undefined);
+
+	fs.writeFileSync(planPath, "  \n  \n  ", "utf-8");
+	assert.equal(readPlanFile(tmpDir), undefined);
+
+	fs.writeFileSync(planPath, "# My Plan\n\nDetails here.\n", "utf-8");
+	assert.equal(readPlanFile(tmpDir), "# My Plan\n\nDetails here.");
 });
 
-test("Implement this plan appends user extra input from ready menu", async () => {
+test("isPlanFileTarget matches pi_plan.md only", () => {
+	const cwd = "/home/user/project";
+	assert.equal(isPlanFileTarget(cwd, { path: "pi_plan.md" }), true);
+	assert.equal(isPlanFileTarget(cwd, { path: "./pi_plan.md" }), true);
+	assert.equal(isPlanFileTarget(cwd, { path: path.join(cwd, "pi_plan.md") }), true);
+	assert.equal(isPlanFileTarget(cwd, { path: "other.md" }), false);
+	assert.equal(isPlanFileTarget(cwd, { path: "sub/pi_plan.md" }), false);
+	assert.equal(isPlanFileTarget(cwd, { path: 42 }), false);
+	assert.equal(isPlanFileTarget(cwd, {}), false);
+	assert.equal(isPlanFileTarget(cwd, "string"), false);
+});
+
+test("isPlanFileTarget refuses a symlinked plan file", (t) => {
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+	const target = path.join(tmpDir, "real.md");
+	fs.writeFileSync(target, "secret", "utf-8");
+	const link = path.join(tmpDir, "pi_plan.md");
+	fs.symlinkSync(target, link);
+	assert.equal(isPlanFileTarget(tmpDir, { path: "pi_plan.md" }), false);
+
+	fs.rmSync(link);
+	assert.equal(isPlanFileTarget(tmpDir, { path: "pi_plan.md" }), true);
+});
+
+test("tool_call gating: write/edit to pi_plan.md allowed, others blocked", async (t) => {
+	const mock = createMockPi({
+		activeTools: ["read", "bash"],
+		allTools: [builtinTool("read"), builtinTool("bash"), builtinTool("edit"), builtinTool("write")],
+	});
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+	const { ctx } = createMockContext({
+		cwd: tmpDir,
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	const toolCallHandlers = mock.events.get("tool_call") ?? [];
+
+	for (const handler of toolCallHandlers) {
+		// write to pi_plan.md → allowed
+		const writePlan = await handler(
+			{ toolName: "write", input: { path: "pi_plan.md", content: "# Plan" } },
+			ctx,
+		);
+		assert.equal(writePlan, undefined, "write to pi_plan.md should be allowed");
+
+		// write to other.md → blocked
+		const writeOther = (await handler(
+			{ toolName: "write", input: { path: "other.md", content: "x" } },
+			ctx,
+		)) as { block?: boolean };
+		assert.equal(writeOther.block, true, "write to other.md should be blocked");
+
+		// edit to pi_plan.md → allowed
+		const editPlan = await handler(
+			{ toolName: "edit", input: { path: "pi_plan.md", oldText: "a", newText: "b" } },
+			ctx,
+		);
+		assert.equal(editPlan, undefined, "edit to pi_plan.md should be allowed");
+
+		// edit to sub/pi_plan.md → blocked
+		const editSub = (await handler(
+			{ toolName: "edit", input: { path: "sub/pi_plan.md", oldText: "a", newText: "b" } },
+			ctx,
+		)) as { block?: boolean };
+		assert.equal(editSub.block, true, "edit to sub/pi_plan.md should be blocked");
+
+		// mutating bash still blocked
+		const bashRm = (await handler(
+			{ toolName: "bash", input: { command: "rm -rf build" } },
+			ctx,
+		)) as { block?: boolean };
+		assert.equal(bashRm.block, true, "mutating bash should be blocked");
+	}
+});
+
+test("Implement this plan appends user extra input from ready menu", async (t) => {
 	const mock = createMockPi({ activeTools: ["read", "bash"] });
 	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
 
 	let selectCalls = 0;
 	const selectValues = ["Implement this plan"];
 	const { ctx } = createMockContext({
+		cwd: tmpDir,
 		hasUI: true,
 		select: async () => selectValues[selectCalls++] ?? undefined,
 		editor: async () => "Also add tests",
@@ -126,30 +219,22 @@ test("Implement this plan appends user extra input from ready menu", async () =>
 	const sessionStartHandlers = mock.events.get("session_start") ?? [];
 	for (const handler of sessionStartHandlers) await handler({}, ctx);
 
+	// Write plan file after session_start so agent_end detects a change
+	fs.writeFileSync(path.join(tmpDir, "pi_plan.md"), "# Fix bug\n\nSteps here.", "utf-8");
+
 	const agentEndHandlers = mock.events.get("agent_end") ?? [];
 	for (const handler of agentEndHandlers) {
 		await handler(
 			{
-				messages: [
-					{
-						message: {
-							role: "assistant",
-							content: [
-								{
-									type: "text",
-									text: "Plan:\n<proposed_plan>\n# Fix bug\n</proposed_plan>",
-								},
-							],
-						},
-					},
-				],
+				messages: [{ message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }],
 			},
 			ctx,
 		);
 	}
 
-	await new Promise((resolve) => setTimeout(resolve, 10));
+	await new Promise((resolve) => setTimeout(resolve, 50));
 
+	assert.equal(selectCalls, 1);
 	assert.equal(mock.sentUserMessages.length, 1);
 	const sent = mock.sentUserMessages[0]?.text ?? "";
 	assert.ok(sent.includes("Implement this proposed plan now"));
@@ -157,13 +242,17 @@ test("Implement this plan appends user extra input from ready menu", async () =>
 	assert.ok(sent.includes("# Fix bug"));
 });
 
-test("Cancelling implementation input returns to ready menu", async () => {
+test("Cancelling implementation input returns to ready menu", async (t) => {
 	const mock = createMockPi({ activeTools: ["read", "bash"] });
 	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
 
 	let selectCalls = 0;
 	const selectValues = ["Implement this plan", "Exit Plan mode"];
 	const { ctx } = createMockContext({
+		cwd: tmpDir,
 		hasUI: true,
 		select: async () => selectValues[selectCalls++] ?? undefined,
 		editor: async () => undefined,
@@ -181,30 +270,88 @@ test("Cancelling implementation input returns to ready menu", async () => {
 	const sessionStartHandlers = mock.events.get("session_start") ?? [];
 	for (const handler of sessionStartHandlers) await handler({}, ctx);
 
-	const agentEndHandlers = mock.events.get("agent_end") ?? [];
-	for (const handler of agentEndHandlers) {
-		await handler(
-			{
-				messages: [
-					{
-						message: {
-							role: "assistant",
-							content: [
-								{
-									type: "text",
-									text: "Plan:\n<proposed_plan>\n# Fix bug\n</proposed_plan>",
-								},
-							],
-						},
-					},
-				],
-			},
-			ctx,
-		);
-	}
+	fs.writeFileSync(path.join(tmpDir, "pi_plan.md"), "# Fix bug\n\nSteps here.", "utf-8");
 
-	await new Promise((resolve) => setTimeout(resolve, 10));
+	const agentEndHandlers = mock.events.get("agent_end") ?? [];
+	for (const handler of agentEndHandlers) await handler({ messages: [] }, ctx);
+
+	await new Promise((resolve) => setTimeout(resolve, 50));
 
 	assert.equal(selectCalls, 2);
 	assert.equal(mock.sentUserMessages.length, 0);
+});
+
+test("agent_end with unchanged plan file does not re-show the ready menu", async (t) => {
+	const mock = createMockPi({ activeTools: ["read", "bash"] });
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+	// Plan file exists before session_start, so the session-start sync adopts it.
+	fs.writeFileSync(path.join(tmpDir, "pi_plan.md"), "# Fix bug\n\nSteps here.", "utf-8");
+
+	let selectCalls = 0;
+	const { ctx } = createMockContext({
+		cwd: tmpDir,
+		hasUI: true,
+		select: async () => {
+			selectCalls++;
+			return undefined;
+		},
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	const agentEndHandlers = mock.events.get("agent_end") ?? [];
+	for (const handler of agentEndHandlers) await handler({ messages: [] }, ctx);
+
+	await new Promise((resolve) => setTimeout(resolve, 50));
+
+	assert.equal(selectCalls, 0);
+});
+
+test("deleting the plan file clears plan-ready state", async (t) => {
+	const mock = createMockPi({ activeTools: ["read", "bash"] });
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+	const planPath = path.join(tmpDir, "pi_plan.md");
+	fs.writeFileSync(planPath, "# Fix bug\n\nSteps here.", "utf-8");
+
+	const { ctx, statuses } = createMockContext({
+		cwd: tmpDir,
+		hasUI: true,
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+	assert.equal(statuses.get("plan-mode"), "plan ready");
+
+	fs.rmSync(planPath);
+
+	const beforeAgentStartHandlers = mock.events.get("before_agent_start") ?? [];
+	for (const handler of beforeAgentStartHandlers) await handler({ systemPrompt: "" }, ctx);
+	assert.equal(statuses.get("plan-mode"), "plan active");
 });
