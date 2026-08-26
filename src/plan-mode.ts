@@ -15,6 +15,21 @@ const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
 const TOOL_SELECTOR_PAGE_SIZE = 10;
 const PLAN_FILE_NAME = "pi_plan.md";
 
+// Context-management tools from billion-context-pi (ACP: compress, decompress,
+// search_context, acp_status) and pi-context (context_checkpoint, context_timeline,
+// context_compact). They only read/rewrite the session conversation, never project
+// files or external systems, so Plan mode enables them by default instead of
+// requiring a user-risk opt-in. Users can still toggle them off via /plan tools.
+const CONTEXT_MANAGEMENT_TOOL_NAMES: ReadonlySet<string> = new Set([
+	"compress",
+	"decompress",
+	"search_context",
+	"acp_status",
+	"context_checkpoint",
+	"context_timeline",
+	"context_compact",
+]);
+
 interface CommandArgumentCompletion {
 	value: string;
 	label: string;
@@ -502,7 +517,7 @@ export default function planMode(pi: ExtensionAPI) {
 				doneChoice,
 			];
 			const choice = await ctx.ui.select(
-				`Plan-mode tools (${pageIndex + 1}/${pageCount}). Non-built-in tools run at user risk.`,
+				`Plan-mode tools (${pageIndex + 1}/${pageCount}). Context-management tools are on by default; other non-built-in tools run at user risk.`,
 				[...choices, ...navigationChoices],
 			);
 			if (!choice || choice === doneChoice) break;
@@ -576,7 +591,11 @@ export default function planMode(pi: ExtensionAPI) {
 
 	function defaultPlanModeToolNames(tools: ToolInfo[]) {
 		return tools
-			.filter((tool) => isBuiltinTool(tool) && SAFE_BUILTIN_PLAN_TOOLS.has(tool.name))
+			.filter(
+				(tool) =>
+					(isBuiltinTool(tool) && SAFE_BUILTIN_PLAN_TOOLS.has(tool.name)) ||
+					isContextManagementTool(tool),
+			)
 			.map((tool) => tool.name);
 	}
 
@@ -738,6 +757,10 @@ export function canSelectToolInPlanMode(tool: ToolInfo) {
 	return true;
 }
 
+export function isContextManagementTool(tool: ToolInfo) {
+	return CONTEXT_MANAGEMENT_TOOL_NAMES.has(tool.name);
+}
+
 function toolNameFromLegacyKey(key: string, tools: ToolInfo[]) {
 	const directName = tools.find((tool) => tool.name === key)?.name;
 	if (directName) return directName;
@@ -758,6 +781,7 @@ function formatToolChoice(tool: ToolInfo, selected: boolean, index: number) {
 }
 
 function toolPolicyLabel(tool: ToolInfo) {
+	if (isContextManagementTool(tool)) return "context management";
 	if (isBuiltinTool(tool)) {
 		if (!SAFE_BUILTIN_PLAN_TOOLS.has(tool.name)) {
 			if (tool.name === "edit" || tool.name === "write") return "built-in plan-file only";
@@ -967,13 +991,14 @@ You are in Plan Mode, a Codex-like collaboration mode for producing a decision-c
 - Stay in Plan Mode until a developer or extension explicitly exits it.
 - Treat requests to implement as requests to plan the implementation; do not edit project files or carry out the plan.
 - Do not use update_plan/TODO tooling in Plan Mode; Plan Mode is conversational planning, not execution progress tracking.
-- Plan Mode manages built-in tool safety only. Non-built-in tools are disabled by default and may be enabled by the user at their own risk.
+- Plan Mode manages built-in tool safety only. Context-management tools (billion-context-pi: \`compress\`, \`decompress\`, \`search_context\`, \`acp_status\`; pi-context: \`context_checkpoint\`, \`context_timeline\`, \`context_compact\`) stay enabled by default; all other non-built-in tools are disabled by default and may be enabled by the user at their own risk.
 - Do not perform mutating actions on project files: no patching, no formatting that rewrites files, no dependency installation, no commits, no migrations.
 - The only writable file in Plan Mode is \`${PLAN_FILE_NAME}\` in the working directory. Use it as the plan document: create it with \`write\` or update it with \`edit\`.
 
 ## Phase 1 — Ground in the environment
 
 - Explore first and ask second. Use non-mutating exploration to read files, search, inspect configuration, run read-only checks, and resolve discoverable facts.
+- Keep the session lean while planning: use the enabled context-management tools (\`compress\`, \`search_context\`, \`decompress\`, \`context_checkpoint\`, \`context_timeline\`) to fold consumed exploration and anchor phases instead of letting context grow unmanaged.
 - Before asking the user any question, perform at least one targeted non-mutating exploration pass unless no local environment or repository is available.
 - Do not ask questions that can be answered from repository or system truth. Ask only when multiple plausible choices remain, a needed identifier/context is missing, or the ambiguity is product intent.
 

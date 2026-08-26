@@ -6,6 +6,7 @@ import test from "node:test";
 import planMode, {
 	canSelectToolInPlanMode,
 	completePlanArguments,
+	isContextManagementTool,
 	isPlanFileTarget,
 	isSafeCommand,
 	normalizePlanModeQuestionParams,
@@ -53,6 +54,65 @@ test("tool selection allows safe built-ins and non-built-ins only", () => {
 		"plan_mode_question",
 	]);
 	assert.deepEqual(withoutPlanModeQuestionTool(["read", "plan_mode_question"]), ["read"]);
+});
+
+test("isContextManagementTool recognizes ACP and pi-context tools by name", () => {
+	type PlanTool = Parameters<typeof isContextManagementTool>[0];
+	for (const name of [
+		"compress",
+		"decompress",
+		"search_context",
+		"acp_status",
+		"context_checkpoint",
+		"context_timeline",
+		"context_compact",
+	]) {
+		assert.equal(isContextManagementTool(extensionTool(name) as PlanTool), true, name);
+	}
+	assert.equal(isContextManagementTool(builtinTool("read") as PlanTool), false);
+	assert.equal(isContextManagementTool(extensionTool("unrelated") as PlanTool), false);
+});
+
+test("context-management tools stay active by default in Plan mode", async (t) => {
+	const mock = createMockPi({
+		activeTools: ["read", "bash", "compress", "context_compact"],
+		allTools: [
+			builtinTool("read"),
+			builtinTool("bash"),
+			extensionTool("compress"),
+			extensionTool("search_context"),
+			extensionTool("context_compact"),
+			extensionTool("unrelated"),
+		],
+	});
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+	const { ctx } = createMockContext({
+		cwd: tmpDir,
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	const active = mock.rawPi.getActiveTools();
+	for (const name of ["compress", "search_context", "context_compact", "read", "bash"]) {
+		assert.ok(active.includes(name), `${name} should be active in Plan mode by default`);
+	}
+	assert.ok(!active.includes("unrelated"), "unrelated extension tool stays disabled");
+	assert.ok(active.includes("edit"), "edit stays required for the plan file");
+	assert.ok(active.includes("write"), "write stays required for the plan file");
+	assert.ok(active.includes("plan_mode_question"));
 });
 
 test("isSafeCommand permits read-only commands and blocks mutating commands", () => {

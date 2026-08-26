@@ -20,7 +20,7 @@ Pi core intentionally does not ship a built-in plan mode; this package provides 
 - Adds `--plan` to start a session in Plan mode.
 - Enables built-in read-only tools by default while Plan mode is active.
 - Unlocks `write` and `edit` tools in Plan mode, but only for the plan file (`pi_plan.md`); all other file mutations are blocked.
-- Disables extension and custom tools by default, with a `/plan tools` selector for explicit user-risk opt-in.
+- Disables extension and custom tools by default, with a `/plan tools` selector for explicit user-risk opt-in; context-management tools (`compress`, `decompress`, `search_context`, `acp_status` from billion-context-pi; `context_checkpoint`, `context_timeline`, `context_compact` from pi-context) are treated as safe — they only read/rewrite session conversation, never project files — and stay enabled by default.
 - Blocks mutating built-in tools and bash commands such as `rm`, `git commit`, dependency installs, redirects, and editor launches.
 - Injects Codex-like Plan mode instructions: explore first, ask decision questions for high-impact ambiguity, do not mutate project files, and finish by writing the plan to `pi_plan.md` only when decision-complete.
 - Adds a required `plan_mode_question` tool so the agent can ask structured Plan-mode questions before finalizing a plan.
@@ -70,6 +70,8 @@ Use `/plan` to enter Plan mode before writing your planning prompt. Use `/plan <
 When Plan mode is active, ask the agent to design the change. The agent may inspect files and run read-only commands, but it should not edit project files or execute the implementation. It should explore first, then use structured questions when your preference or a tradeoff materially changes the plan.
 
 By default, Plan mode manages only Pi's built-in tools: `read`, limited `bash`, available read-only built-ins such as `grep`, `find`, and `ls`, plus the required `plan_mode_question` tool. Built-in `edit` and `write` are also active but gated to `pi_plan.md` only. Extension and custom tools are disabled by default because Pi tools do not expose standardized mutability metadata; enable them from `/plan tools` only when you accept the risk for that session. For example, you can opt into `firecrawl_scrape`, `firecrawl_search`, or `biome_lsp_diagnostics` if those extensions are loaded and you want to use them during planning.
+
+Context-management extensions are the deliberate exception: their tools never touch project files or external systems, only the session conversation. Plan mode therefore enables them by default and labels them `context management` in the `/plan tools` selector (where you can still toggle them off). Currently recognized: billion-context-pi's `compress`, `decompress`, `search_context`, `acp_status` and pi-context's `context_checkpoint`, `context_timeline`, `context_compact`. During long planning sessions the agent can use them to fold consumed exploration and anchor phases instead of letting context grow unmanaged.
 
 `plan_mode_question` follows Codex's `request_user_input` pattern: the agent can ask 1-3 concise questions, each with meaningful options and a free-form Other path. If you cancel or no interactive UI is available, the agent should ask a concise plain-text question or proceed only with a clearly stated low-risk assumption instead of prematurely producing a final plan.
 
