@@ -10,6 +10,7 @@ import planMode, {
 	isPlanFileTarget,
 	isSafeCommand,
 	normalizePlanModeQuestionParams,
+	PLAN_EMBED_MAX_CHARS,
 	readPlanFile,
 	withoutPlanModeQuestionTool,
 	withRequiredPlanModeTools,
@@ -335,6 +336,255 @@ test("Implement this plan appends user extra input from ready menu", async (t) =
 	assert.ok(sent.includes("Implement this proposed plan now"));
 	assert.ok(sent.includes("Additional instructions from user:\nAlso add tests"));
 	assert.ok(sent.includes("# Fix bug"));
+	assert.ok(sent.includes("Work through the plan step by step"));
+	assert.ok(sent.includes("update the plan first and note the deviation"));
+	assert.ok(sent.includes("report any deviations from the plan"));
+});
+
+test("Implementing a plan larger than PLAN_EMBED_MAX_CHARS points at the file instead of embedding it", async (t) => {
+	const mock = createMockPi({ activeTools: ["read", "bash"] });
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+	let selectCalls = 0;
+	const selectValues = ["Implement this plan"];
+	const { ctx } = createMockContext({
+		cwd: tmpDir,
+		hasUI: true,
+		select: async () => selectValues[selectCalls++] ?? undefined,
+		editor: async () => "",
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	const marker = "LARGE_PLAN_UNIQUE_MARKER_7f3a";
+	const largePlan = `# Big change\n\n${marker} ${`detail line\n`.repeat(PLAN_EMBED_MAX_CHARS / 12)}`;
+	assert.ok(largePlan.length > PLAN_EMBED_MAX_CHARS);
+	fs.writeFileSync(path.join(tmpDir, "pi_plan.md"), largePlan, "utf-8");
+
+	const agentEndHandlers = mock.events.get("agent_end") ?? [];
+	for (const handler of agentEndHandlers) {
+		await handler(
+			{
+				messages: [{ message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }],
+			},
+			ctx,
+		);
+	}
+
+	await new Promise((resolve) => setTimeout(resolve, 50));
+
+	assert.equal(selectCalls, 1);
+	assert.equal(mock.sentUserMessages.length, 1);
+	const sent = mock.sentUserMessages[0]?.text ?? "";
+	assert.ok(sent.includes("Implement the plan in pi_plan.md in the working directory"));
+	assert.ok(sent.includes("read it now, then follow it faithfully"));
+	assert.ok(
+		!sent.includes(marker),
+		"a plan above the embed threshold must not be embedded verbatim",
+	);
+	assert.ok(sent.includes("Plan mode is now disabled. Full tool access is restored."));
+	assert.ok(sent.includes("Work through the plan step by step"));
+});
+
+test("context hook appends plan adherence reminder while implementing", async (t) => {
+	const mock = createMockPi({ activeTools: ["read", "bash"] });
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+	let selectCalls = 0;
+	const selectValues = ["Implement this plan"];
+	const { ctx } = createMockContext({
+		cwd: tmpDir,
+		hasUI: true,
+		select: async () => selectValues[selectCalls++] ?? undefined,
+		editor: async () => "",
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	fs.writeFileSync(path.join(tmpDir, "pi_plan.md"), "# Fix bug\n\nSteps here.", "utf-8");
+
+	const agentEndHandlers = mock.events.get("agent_end") ?? [];
+	for (const handler of agentEndHandlers) {
+		await handler(
+			{
+				messages: [{ message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }],
+			},
+			ctx,
+		);
+	}
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(selectCalls, 1, "implementation should have started");
+
+	const contextHandlers = mock.events.get("context") ?? [];
+	assert.ok(contextHandlers.length > 0);
+
+	const runContext = async (lastMessage?: unknown) => {
+		let result: { messages: unknown[] } = { messages: [] };
+		for (const handler of contextHandlers) {
+			result = (await handler(
+				{
+					messages: [
+						{
+							message: lastMessage ?? {
+								role: "tool",
+								content: [{ type: "text", text: "tool result" }],
+							},
+						},
+					],
+				},
+				ctx,
+			)) as { messages: unknown[] };
+		}
+		return result.messages;
+	};
+
+	const messages = await runContext();
+	assert.equal(messages.length, 2, "one adherence reminder should be appended");
+	const last = messages[1] as { message?: { content?: Array<{ type?: string; text?: string }> } };
+	const parts = last.message?.content ?? [];
+	assert.ok(
+		parts.some((part) => part.type === "text" && (part.text ?? "").includes("[plan-adherence]")),
+		"the appended message should carry the adherence marker",
+	);
+
+	// Reminder keeps being appended on later LLM calls while implementing.
+	const messagesAgain = await runContext();
+	assert.equal(messagesAgain.length, 2);
+
+	// A user message right before the call gets no reminder: the handoff
+	// guidance is already the last word, and stacking user turns pollutes
+	// the UI and can trip strict provider role checks.
+	const messagesAfterUser = await runContext({
+		role: "user",
+		content: [{ type: "text", text: "Continue implementing" }],
+	});
+	assert.equal(messagesAfterUser.length, 1, "no reminder after a fresh user message");
+
+	// Deleting the plan file ends the handoff: no more reminders.
+	fs.rmSync(path.join(tmpDir, "pi_plan.md"));
+	const messagesAfterDelete = await runContext();
+	assert.equal(messagesAfterDelete.length, 1, "no reminder once the plan file is gone");
+});
+
+test("agent_end archives the consumed plan and stops adherence reminders", async (t) => {
+	const mock = createMockPi({ activeTools: ["read", "bash"] });
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+	let selectCalls = 0;
+	const selectValues = ["Implement this plan"];
+	const { ctx } = createMockContext({
+		cwd: tmpDir,
+		hasUI: true,
+		select: async () => selectValues[selectCalls++] ?? undefined,
+		editor: async () => "",
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	fs.writeFileSync(path.join(tmpDir, "pi_plan.md"), "# Fix bug\n\nSteps here.", "utf-8");
+
+	const agentEndHandlers = mock.events.get("agent_end") ?? [];
+	for (const handler of agentEndHandlers) {
+		await handler(
+			{
+				messages: [{ message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }],
+			},
+			ctx,
+		);
+	}
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(selectCalls, 1, "implementation should have started");
+	assert.ok(
+		fs.existsSync(path.join(tmpDir, "pi_plan.md")),
+		"the plan file is still on disk while the implementing run is active",
+	);
+
+	// The implementing run finishes: the consumed plan is archived and the
+	// adherence reminders stop.
+	for (const handler of agentEndHandlers) {
+		await handler(
+			{
+				messages: [{ message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }],
+			},
+			ctx,
+		);
+	}
+
+	const archiveDir = path.join(tmpDir, ".pi", "plan");
+	assert.ok(fs.existsSync(archiveDir), "archive directory should be created");
+	const archivedFiles = fs.readdirSync(archiveDir);
+	assert.equal(archivedFiles.length, 1, "the plan should be archived exactly once");
+	assert.ok(archivedFiles[0].startsWith("pi_plan-"), "archived file keeps the plan name prefix");
+	assert.ok(!fs.existsSync(path.join(tmpDir, "pi_plan.md")), "the plan file should be moved away");
+
+	const contextHandlers = mock.events.get("context") ?? [];
+	let result: { messages: unknown[] } = { messages: [] };
+	for (const handler of contextHandlers) {
+		result = (await handler(
+			{
+				messages: [
+					{
+						message: {
+							role: "tool",
+							content: [{ type: "text", text: "tool result" }],
+						},
+					},
+				],
+			},
+			ctx,
+		)) as { messages: unknown[] };
+	}
+	assert.equal(result.messages.length, 1, "no reminders once the plan is archived");
+
+	// A later agent_end outside the handoff is a no-op: nothing to archive again.
+	for (const handler of agentEndHandlers) {
+		await handler(
+			{
+				messages: [{ message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }],
+			},
+			ctx,
+		);
+	}
+	assert.equal(fs.readdirSync(archiveDir).length, 1, "no duplicate archive entries");
 });
 
 test("Cancelling implementation input returns to ready menu", async (t) => {

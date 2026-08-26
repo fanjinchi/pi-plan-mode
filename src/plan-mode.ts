@@ -14,6 +14,21 @@ const BLOCKED_BUILTIN_TOOLS = new Set(["edit", "write"]);
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
 const TOOL_SELECTOR_PAGE_SIZE = 10;
 const PLAN_FILE_NAME = "pi_plan.md";
+const PLAN_PROGRESS_FILE_NAME = "plan.progress.md";
+const PLAN_ADHERENCE_MARKER = "[plan-adherence]";
+// Consumed plans are archived under the project-local .pi/ directory (the
+// same convention pi uses for .pi/extensions, .pi/skills, .pi/prompts, ...)
+// so the working tree stays clean and past plans remain consultable.
+const PLAN_ARCHIVE_DIR_NAME = path.join(".pi", "plan");
+// Shared step-tracking wording, used both by the one-time handoff message and
+// by the per-call adherence reminder so they cannot drift apart.
+const PLAN_PROGRESS_TRACKING_INSTRUCTION = `keep the steps checked off as you complete them, marking progress in the plan file itself or in a ${PLAN_PROGRESS_FILE_NAME} beside it`;
+
+// Plans at or below this size are embedded verbatim in the implementation
+// message so they act as first-class instructions; larger plans stay on disk
+// and the implementing run reads them on demand, so a long implementation does
+// not carry the full plan text in context the whole time.
+export const PLAN_EMBED_MAX_CHARS = 8000;
 
 // Context-management tools from billion-context-pi (ACP: compress, decompress,
 // search_context, acp_status) and pi-context (context_checkpoint, context_timeline,
@@ -42,6 +57,10 @@ interface PlanModeState {
 	awaitingAction: boolean;
 	selectedToolNames?: string[];
 	selectedToolKeys?: string[];
+	// True while an implementation handoff is active: plan mode is off but the
+	// plan file still exists, so the context hook keeps re-anchoring the model
+	// to the plan.
+	implementing: boolean;
 }
 
 type SessionEntry = {
@@ -221,7 +240,7 @@ const PURE_READ_BASH_COMMANDS: ReadonlySet<string> = new Set([
 ]);
 
 export default function planMode(pi: ExtensionAPI) {
-	let state: PlanModeState = { enabled: false, awaitingAction: false };
+	let state: PlanModeState = { enabled: false, awaitingAction: false, implementing: false };
 	let previousTools: string[] | undefined;
 
 	pi.registerFlag("plan", {
@@ -342,16 +361,37 @@ export default function planMode(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("context", async (event) => {
+	pi.on("context", async (event, ctx) => {
 		const messagesWithoutLegacyPlanContext = event.messages.filter(
 			(message: unknown) => !messageContainsLegacyPlanModeContextArtifact(message),
 		);
 		if (state.enabled) return { messages: messagesWithoutLegacyPlanContext };
-		return {
-			messages: messagesWithoutLegacyPlanContext.filter(
-				(message: unknown) => !messageContainsInactivePlanModeArtifact(message),
-			),
-		};
+
+		let messages = messagesWithoutLegacyPlanContext.filter(
+			(message: unknown) => !messageContainsInactivePlanModeArtifact(message),
+		);
+
+		if (state.implementing) {
+			const cwd = ctx.cwd;
+			if (typeof cwd !== "string") return { messages };
+			try {
+				if (!fs.existsSync(planFilePath(cwd))) {
+					// The plan file is gone, so the implementation handoff is over.
+					state = { ...state, implementing: false };
+					persistState();
+				} else {
+					// Keep the plan prominent during implementation: re-anchor the
+					// model on every LLM call (like Claude Code's per-message
+					// plan-mode injection), so long sessions do not drift away
+					// from the plan.
+					messages = withPlanAdherenceReminder(messages) as typeof event.messages;
+				}
+			} catch {
+				// Unreadable plan path: skip the injection rather than breaking
+				// the whole context event.
+			}
+		}
+		return { messages };
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
@@ -364,7 +404,17 @@ export default function planMode(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		if (!state.enabled) return;
+		if (!state.enabled) {
+			// An implementing run just finished: the plan has been consumed.
+			// Archive it into .pi/plan/ (the archive doubles as the backup) and
+			// stop the adherence reminders.
+			if (state.implementing) {
+				archivePlanFile(ctx);
+				state = { ...state, implementing: false };
+				persistState();
+			}
+			return;
+		}
 
 		const previous = state.latestPlan;
 		const plan = readPlanFile(ctx.cwd);
@@ -396,7 +446,7 @@ export default function planMode(pi: ExtensionAPI) {
 
 	function enterPlanMode(ctx: ExtensionContext) {
 		if (!state.enabled) previousTools = withoutPlanModeQuestionTool(safeGetActiveTools());
-		state = { ...state, enabled: true, awaitingAction: false };
+		state = { ...state, enabled: true, awaitingAction: false, implementing: false };
 		activatePlanModeTools();
 		persistState();
 		updateUi(ctx);
@@ -416,7 +466,17 @@ export default function planMode(pi: ExtensionAPI) {
 
 	function exitPlanMode(ctx: ExtensionContext) {
 		const wasEnabled = state.enabled;
-		state = { ...state, enabled: false, latestPlan: undefined, awaitingAction: false };
+		// Leaving plan mode also ends any active implementation handoff, so a
+		// /plan exit stops the adherence reminders even while pi_plan.md is
+		// still on disk. startImplementation calls this before setting
+		// implementing: true, so the ordering stays safe.
+		state = {
+			...state,
+			enabled: false,
+			latestPlan: undefined,
+			awaitingAction: false,
+			implementing: false,
+		};
 		if (wasEnabled) restoreTools();
 		persistState();
 		updateUi(ctx);
@@ -437,7 +497,8 @@ export default function planMode(pi: ExtensionAPI) {
 	}
 
 	function startImplementation(ctx: ExtensionContext, extraInput?: string) {
-		const plan = readPlanFile(ctx.cwd) ?? state.latestPlan?.trim();
+		const planFromFile = readPlanFile(ctx.cwd);
+		const plan = planFromFile ?? state.latestPlan?.trim();
 		exitPlanMode(ctx);
 
 		if (!plan) {
@@ -445,9 +506,28 @@ export default function planMode(pi: ExtensionAPI) {
 			return;
 		}
 
+		state = { ...state, implementing: true };
+		persistState();
+
 		const extra = extraInput ? `\n\nAdditional instructions from user:\n${extraInput}` : "";
+		// Small plans are embedded verbatim so they act as first-class
+		// instructions; larger plans stay on disk and the implementing run reads
+		// them on demand, so a long implementation does not carry the full plan
+		// text in context the whole time.
+		// Pointing at a file only works when that file really exists; if the plan
+		// lives only in memory (file deleted or never written), embed it so the
+		// implementing run never gets told to read a nonexistent file.
+		const planOnDisk = planFromFile !== undefined;
+		const planInstruction =
+			planOnDisk && plan.length > PLAN_EMBED_MAX_CHARS
+				? `Implement the plan in ${PLAN_FILE_NAME} in the working directory: read it now, then follow it faithfully, and re-read it whenever you need to check the exact steps.`
+				: `Implement this proposed plan now:\n\n${plan}`;
+		// Step-tracking + deviation handling: turns the plan into a checklist the
+		// model marks off as it goes and forces plan-first changes (Codex/Cursor
+		// style), plus a closing deviation report (Codex receipt style).
+		const adherenceGuidance = `\n\nWork through the plan step by step and ${PLAN_PROGRESS_TRACKING_INSTRUCTION}. If a step needs to change, update the plan first and note the deviation and why, then continue. When you are done, report any deviations from the plan and anything left unfinished.`;
 		sendPlanModeUserMessage(
-			`Plan mode is now disabled. Full tool access is restored. Implement this proposed plan now:\n\n${plan}${extra}`,
+			`Plan mode is now disabled. Full tool access is restored. ${planInstruction}${adherenceGuidance}${extra}`,
 			ctx,
 		);
 	}
@@ -702,6 +782,7 @@ export default function planMode(pi: ExtensionAPI) {
 			awaitingAction: enabled ? (entry.data.awaitingAction ?? false) : false,
 			selectedToolNames: entry.data.selectedToolNames,
 			selectedToolKeys: entry.data.selectedToolKeys,
+			implementing: entry.data.implementing ?? false,
 		};
 	}
 
@@ -1172,6 +1253,24 @@ export function readPlanFile(cwd: string): string | undefined {
 	}
 }
 
+function archivePlanFile(ctx: ExtensionContext) {
+	const planPath = planFilePath(ctx.cwd);
+	try {
+		if (!fs.existsSync(planPath)) return;
+		fs.mkdirSync(path.join(ctx.cwd, PLAN_ARCHIVE_DIR_NAME), { recursive: true });
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const archivedPath = path.join(
+			ctx.cwd,
+			PLAN_ARCHIVE_DIR_NAME,
+			`${PLAN_FILE_NAME.replace(/\.md$/, "")}-${stamp}.md`,
+		);
+		fs.renameSync(planPath, archivedPath);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(`Plan mode archive failed: ${message}`);
+	}
+}
+
 export function isPlanFileTarget(cwd: string, input: unknown): boolean {
 	if (!isRecord(input)) return false;
 	const p = input.path;
@@ -1198,4 +1297,39 @@ function messageContainsInactivePlanModeArtifact(message: unknown) {
 function unwrapSessionMessage(message: unknown) {
 	const entry = message as { message?: unknown };
 	return (entry.message ?? message) as { role?: string; customType?: string; content?: unknown };
+}
+
+function withPlanAdherenceReminder(messages: unknown[]): unknown[] {
+	if (messages.length === 0) return messages;
+	const candidate = unwrapSessionMessage(messages[messages.length - 1]);
+	// Do not stack a user-role reminder directly after a user message: the
+	// handoff already carries the full guidance, and consecutive same-role
+	// entries pollute the UI and can trip strict provider role checks.
+	if (candidate.role === "user") return messages;
+	if (messageText(candidate.content).includes(PLAN_ADHERENCE_MARKER)) return messages;
+	return [...messages, { message: buildAdherenceReminderMessage() }];
+}
+
+function buildAdherenceReminderMessage() {
+	return {
+		role: "user",
+		content: [{ type: "text", text: planAdherenceReminder() }],
+		timestamp: Date.now(),
+	};
+}
+
+function planAdherenceReminder() {
+	return `${PLAN_ADHERENCE_MARKER} You are implementing the plan in ${PLAN_FILE_NAME} in the working directory. Follow its steps and ${PLAN_PROGRESS_TRACKING_INSTRUCTION}. If a step must change, update the plan first and note the deviation and why. When done, report deviations and anything left unfinished.`;
+}
+
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter(
+			(part): part is { type: "text"; text: string } =>
+				isRecord(part) && part.type === "text" && typeof part.text === "string",
+		)
+		.map((part) => part.text)
+		.join("\n");
 }
