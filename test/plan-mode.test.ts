@@ -123,6 +123,41 @@ test("isSafeCommand permits read-only commands and blocks mutating commands", ()
 	assert.equal(isSafeCommand(""), false);
 });
 
+test("isSafeCommand allows read-only searches whose patterns mention mutating words", () => {
+	assert.equal(isSafeCommand('grep -rn "code" ~/.pi/agent/skills/'), true);
+	assert.equal(isSafeCommand("grep -rn npm install ~/.pi/agent/"), true);
+	assert.equal(isSafeCommand('grep -rn "rm -rf" docs/'), true);
+	assert.equal(isSafeCommand('grep -rn "git push" docs/'), true);
+	assert.equal(isSafeCommand('rg -n "vim" ~/.pi/agent/npm/node_modules/'), true);
+	assert.equal(isSafeCommand('grep -rn "a > b" .'), true);
+	assert.equal(isSafeCommand("grep -rn code ~/.pi/agent/skills/open-code-review"), true);
+	assert.equal(isSafeCommand("grep -rn system( src/"), true);
+	assert.equal(isSafeCommand("grep -rn '$(x)' docs/"), true);
+	assert.equal(isSafeCommand("grep foo ~/.pi 2>&1 | head -20"), true);
+	assert.equal(isSafeCommand("cd ~/.pi/agent/skills && grep -rn context ."), true);
+	assert.equal(isSafeCommand("find . -name rm"), true);
+	assert.equal(isSafeCommand('echo "a;b"'), true);
+});
+
+test("isSafeCommand blocks mutations hiding in pipes, redirects, and find flags", () => {
+	assert.equal(isSafeCommand("grep -l foo * | xargs rm"), false);
+	assert.equal(isSafeCommand("echo hi | bash"), false);
+	assert.equal(isSafeCommand("cd / && rm -rf / && git push"), false);
+	assert.equal(isSafeCommand("find . -delete"), false);
+	assert.equal(isSafeCommand("find . -exec rm {} +"), false);
+	assert.equal(isSafeCommand("find . -ok rm {} \\;"), false);
+	assert.equal(isSafeCommand("grep foo > out.txt"), false);
+	assert.equal(isSafeCommand("grep foo 2> /dev/null"), false);
+	assert.equal(isSafeCommand('grep -rn "$(rm -rf /)" .'), false);
+	assert.equal(isSafeCommand("grep a\nrm -rf /"), false);
+	assert.equal(isSafeCommand("cat <(rm -rf /)"), false);
+	assert.equal(isSafeCommand("echo 'rm -rf /' | sh"), false);
+	assert.equal(isSafeCommand("git log --grep='npm install' -5"), false);
+	assert.equal(isSafeCommand("awk '{system(\"rm -rf /\")}'"), false);
+	assert.equal(isSafeCommand("touch new.md"), false);
+	assert.equal(isSafeCommand("npm install --save-dev typescript"), false);
+});
+
 test("normalizePlanModeQuestionParams validates question shape", () => {
 	const result = normalizePlanModeQuestionParams({
 		questions: [

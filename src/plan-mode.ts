@@ -168,13 +168,9 @@ const MUTATING_BASH_PATTERNS = [
 	/\bpip\s+(install|uninstall)\b/i,
 	/\buv\s+(add|remove|sync|lock|pip\s+install)\b/i,
 	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|switch|stash|cherry-pick|revert|tag|init|clone)\b/i,
-	/\bsudo\b/i,
-	/\bsu\b/i,
-	/\bkill\b/i,
-	/\bpkill\b/i,
-	/\bkillall\b/i,
-	/\breboot\b/i,
-	/\bshutdown\b/i,
+	/\b(sudo|su|kill|pkill|killall|reboot|shutdown)\b/i,
+	/\b(?:bash|zsh|fish|ksh|dash|csh|tcsh|pwsh)\b/i,
+	/\bsystem\s*\(/i,
 	/\bsystemctl\s+(start|stop|restart|enable|disable)\b/i,
 	/\bservice\s+\S+\s+(start|stop|restart)\b/i,
 	/\b(vim?|nano|emacs|code|subl)\b/i,
@@ -183,10 +179,46 @@ const MUTATING_BASH_PATTERNS = [
 const SAFE_BASH_PATTERNS = [
 	/^\s*(cat|head|tail|less|more|grep|find|ls|pwd|echo|printf|wc|sort|uniq|diff|file|stat|du|df|tree|which|whereis|type|env|printenv|uname|whoami|id|date|uptime|ps|jq|awk|rg|fd|bat|eza)\b/i,
 	/^\s*sed\s+-n\b/i,
+	/^\s*cd\b/i,
 	/^\s*git\s+(status|log|diff|show|branch|remote|config\s+--get|ls-files|grep)\b/i,
 	/^\s*npm\s+(list|ls|view|info|search|outdated|audit)\b/i,
 	/^\s*(node|python|python3|npm|tsc|biome|ruff|ty)\s+--version\b/i,
 ];
+
+// Commands that are read-only by construction: they can neither write files nor
+// execute other programs on their own. For these, search patterns and arguments
+// are inert, so the mutating-keyword list below is skipped entirely — "grep -rn
+// "rm -rf" ." or "grep -rn code docs/" are legitimate searches and must not be
+// blocked just because the searched text resembles a mutating command.
+const PURE_READ_BASH_COMMANDS: ReadonlySet<string> = new Set([
+	"cat",
+	"head",
+	"tail",
+	"less",
+	"more",
+	"grep",
+	"rg",
+	"ag",
+	"ls",
+	"pwd",
+	"wc",
+	"sort",
+	"uniq",
+	"diff",
+	"file",
+	"stat",
+	"du",
+	"df",
+	"tree",
+	"which",
+	"whereis",
+	"type",
+	"ps",
+	"jq",
+	"fd",
+	"bat",
+	"eza",
+]);
 
 export default function planMode(pi: ExtensionAPI) {
 	let state: PlanModeState = { enabled: false, awaitingAction: false };
@@ -1038,8 +1070,93 @@ function readCommand(input: unknown) {
 export function isSafeCommand(command: string) {
 	const trimmed = command.trim();
 	if (!trimmed) return false;
-	if (MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(trimmed))) return false;
-	return SAFE_BASH_PATTERNS.some((pattern) => pattern.test(trimmed));
+
+	// Treat newlines as command separators so a second line cannot smuggle a
+	// mutating command past the per-segment allowlist check.
+	const singleLine = trimmed.replace(/\n+/g, "; ");
+
+	// Strip quoted strings: words inside quotes are search patterns or text, not
+	// commands to execute ("grep -rn 'rm -rf' ." must be allowed).
+	const unquoted = singleLine.replace(/"[^"]*"|'[^']*'/g, " ");
+
+	// Command substitution expands inside double quotes and unquoted, but not
+	// inside single quotes — so strip only single-quoted strings for this check.
+	const noSingleQuotes = singleLine.replace(/'[^']*'/g, " ");
+	if (/\$\(|`/.test(noSingleQuotes)) return false;
+
+	// Redirects write files; block every unquoted one except harmless fd-to-fd
+	// forms like 2>&1 ("grep foo 2>&1 | head" is read-only). Heredocs (<<, <<<)
+	// and process substitution (<(...)) are blocked because their bodies can
+	// smuggle arbitrary commands.
+	const noFdRedirs = unquoted.replace(/\b[012]>&[012]\b/g, "");
+	if (/(^|[^<])>(?!>)|>>|<<|<\s*\(/.test(noFdRedirs)) return false;
+
+	// Every pipeline stage / ; / && / || branch must independently pass the
+	// allowlist. This stops "grep foo | xargs rm", "echo hi | bash",
+	// "cd / && rm -rf /" and friends from hiding behind a read-only first word.
+	const segments = splitShellSegments(singleLine);
+	if (segments.length === 0) return false;
+
+	for (const segment of segments) {
+		if (!SAFE_BASH_PATTERNS.some((pattern) => pattern.test(segment))) return false;
+
+		const head = firstCommandWord(segment);
+		if (!head || PURE_READ_BASH_COMMANDS.has(head)) continue;
+
+		// find can mutate via -delete/-exec/-ok; other flags are read-only, so a
+		// search for a file named "rm" must not trip the keyword list.
+		if (head === "find") {
+			if (/\s-(?:delete|exec|ok)\b/i.test(segment)) return false;
+			continue;
+		}
+
+		// Non-pure-read heads (echo, printf, awk, sed, git, npm, env, ...) are
+		// checked against the mutating keywords on the full segment text (quotes
+		// intact) — e.g. awk '{system("rm -rf /")}' stays blocked.
+		const segmentNoFdRedirs = segment.replace(/\b[012]>&[012]\b/g, "");
+		if (MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(segmentNoFdRedirs))) return false;
+	}
+	return true;
+}
+
+// Splits a command on unquoted separators (|, ;, &&, ||), so quoted search
+// patterns like "a;b" or "x | y" do not produce phantom segments.
+function splitShellSegments(command: string): string[] {
+	const segments: string[] = [];
+	let current = "";
+	let quote: string | undefined;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote) {
+			current += ch;
+			if (ch === quote) quote = undefined;
+			continue;
+		}
+		if (ch === '"' || ch === "'") {
+			quote = ch;
+			current += ch;
+			continue;
+		}
+		if (ch === "|" || ch === ";") {
+			segments.push(current);
+			current = "";
+			continue;
+		}
+		if (ch === "&" && command[i + 1] === "&") {
+			segments.push(current);
+			current = "";
+			i++;
+			continue;
+		}
+		current += ch;
+	}
+	segments.push(current);
+	return segments;
+}
+
+function firstCommandWord(segment: string): string | undefined {
+	const match = /^\s*([A-Za-z_][A-Za-z0-9_+-]*)/.exec(segment);
+	return match?.[1]?.toLowerCase();
 }
 
 export function planFilePath(cwd: string): string {
