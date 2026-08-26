@@ -404,17 +404,10 @@ export default function planMode(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
-		if (!state.enabled) {
-			// An implementing run just finished: the plan has been consumed.
-			// Archive it into .pi/plan/ (the archive doubles as the backup) and
-			// stop the adherence reminders.
-			if (state.implementing) {
-				archivePlanFile(ctx);
-				state = { ...state, implementing: false };
-				persistState();
-			}
-			return;
-		}
+		// Archiving happens on agent_settled, not here: after agent_end pi may
+		// still retry, auto-compact, or run queued follow-ups, and the plan file
+		// must stay in place while pi can still keep implementing.
+		if (!state.enabled) return;
 
 		const previous = state.latestPlan;
 		const plan = readPlanFile(ctx.cwd);
@@ -442,6 +435,19 @@ export default function planMode(pi: ExtensionAPI) {
 				{ triggerTurn: false },
 			);
 		});
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		// Fired only when pi will not automatically continue (no retry,
+		// auto-compaction, or queued follow-up pending): the implementing
+		// phase has settled, so the consumed plan is archived and the
+		// adherence reminders stop. A settled handoff counts as consumed even
+		// on interruption — the archive under .pi/plan/ is the recoverable
+		// backup for that case.
+		if (state.enabled || !state.implementing) return;
+		archivePlanFile(ctx);
+		state = { ...state, implementing: false };
+		persistState();
 	});
 
 	function enterPlanMode(ctx: ExtensionContext) {
@@ -506,9 +512,6 @@ export default function planMode(pi: ExtensionAPI) {
 			return;
 		}
 
-		state = { ...state, implementing: true };
-		persistState();
-
 		const extra = extraInput ? `\n\nAdditional instructions from user:\n${extraInput}` : "";
 		// Small plans are embedded verbatim so they act as first-class
 		// instructions; larger plans stay on disk and the implementing run reads
@@ -525,11 +528,20 @@ export default function planMode(pi: ExtensionAPI) {
 		// Step-tracking + deviation handling: turns the plan into a checklist the
 		// model marks off as it goes and forces plan-first changes (Codex/Cursor
 		// style), plus a closing deviation report (Codex receipt style).
-		const adherenceGuidance = `\n\nWork through the plan step by step and ${PLAN_PROGRESS_TRACKING_INSTRUCTION}. If a step needs to change, update the plan first and note the deviation and why, then continue. When you are done, report any deviations from the plan and anything left unfinished.`;
+		const adherenceGuidance = `\n\nWork through the plan step by step and ${PLAN_PROGRESS_TRACKING_INSTRUCTION}. If a step needs to change, update the plan first and note the deviation and why, then continue. When you are done, report any deviations from the plan and anything left unfinished. When the implementing phase ends, ${PLAN_FILE_NAME} is archived under ${PLAN_ARCHIVE_DIR_NAME} for reference.`;
 		sendPlanModeUserMessage(
 			`Plan mode is now disabled. Full tool access is restored. ${planInstruction}${adherenceGuidance}${extra}`,
 			ctx,
 		);
+
+		// Only file-based handoffs get the per-call reminder lifecycle: the
+		// reminder anchors on pi_plan.md's presence, while memory-only plans
+		// are embedded verbatim and need no re-anchoring. The flag is set
+		// after the send so a throwing send cannot leave a stuck handoff.
+		if (planOnDisk) {
+			state = { ...state, implementing: true };
+			persistState();
+		}
 	}
 
 	async function confirmStartImplementation(ctx: ExtensionContext): Promise<boolean> {
@@ -1254,17 +1266,29 @@ export function readPlanFile(cwd: string): string | undefined {
 }
 
 function archivePlanFile(ctx: ExtensionContext) {
-	const planPath = planFilePath(ctx.cwd);
+	// Guard before any path math: path.join on a non-string cwd would throw
+	// outside the try/catch below.
+	if (typeof ctx.cwd !== "string") return;
 	try {
-		if (!fs.existsSync(planPath)) return;
+		const planPath = planFilePath(ctx.cwd);
+		const progressPath = path.join(ctx.cwd, PLAN_PROGRESS_FILE_NAME);
+		if (!fs.existsSync(planPath) && !fs.existsSync(progressPath)) return;
 		fs.mkdirSync(path.join(ctx.cwd, PLAN_ARCHIVE_DIR_NAME), { recursive: true });
 		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-		const archivedPath = path.join(
-			ctx.cwd,
-			PLAN_ARCHIVE_DIR_NAME,
-			`${PLAN_FILE_NAME.replace(/\.md$/, "")}-${stamp}.md`,
-		);
-		fs.renameSync(planPath, archivedPath);
+		// Archive the plan file and, if the model created one, the progress
+		// file beside it, so the working tree stays clean after implementation.
+		for (const [sourcePath, prefix] of [
+			[planPath, PLAN_FILE_NAME],
+			[progressPath, PLAN_PROGRESS_FILE_NAME],
+		] as const) {
+			if (!fs.existsSync(sourcePath)) continue;
+			const archivedPath = path.join(
+				ctx.cwd,
+				PLAN_ARCHIVE_DIR_NAME,
+				`${prefix.replace(/\.md$/, "")}-${stamp}.md`,
+			);
+			fs.renameSync(sourcePath, archivedPath);
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(`Plan mode archive failed: ${message}`);
@@ -1306,8 +1330,19 @@ function withPlanAdherenceReminder(messages: unknown[]): unknown[] {
 	// handoff already carries the full guidance, and consecutive same-role
 	// entries pollute the UI and can trip strict provider role checks.
 	if (candidate.role === "user") return messages;
-	if (messageText(candidate.content).includes(PLAN_ADHERENCE_MARKER)) return messages;
+	// Check the whole list, not just the last message: once an earlier
+	// reminder has been persisted into the transcript it anchors the model
+	// by itself, so a long implementation accumulates exactly one copy
+	// instead of one per LLM call.
+	if (hasAdherenceReminder(messages)) return messages;
 	return [...messages, { message: buildAdherenceReminderMessage() }];
+}
+
+function hasAdherenceReminder(messages: unknown[]): boolean {
+	return messages.some((message) => {
+		const candidate = unwrapSessionMessage(message);
+		return messageText(candidate.content).includes(PLAN_ADHERENCE_MARKER);
+	});
 }
 
 function buildAdherenceReminderMessage() {

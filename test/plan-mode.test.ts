@@ -452,7 +452,7 @@ test("context hook appends plan adherence reminder while implementing", async (t
 					messages: [
 						{
 							message: lastMessage ?? {
-								role: "tool",
+								role: "toolResult",
 								content: [{ type: "text", text: "tool result" }],
 							},
 						},
@@ -485,6 +485,17 @@ test("context hook appends plan adherence reminder while implementing", async (t
 		content: [{ type: "text", text: "Continue implementing" }],
 	});
 	assert.equal(messagesAfterUser.length, 1, "no reminder after a fresh user message");
+
+	// An earlier reminder already persisted in the transcript is enough: no
+	// second copy is appended on later calls.
+	const messagesWithExistingReminder = await runContext({
+		role: "toolResult",
+		content: [
+			{ type: "text", text: "tool result" },
+			{ type: "text", text: "[plan-adherence] already injected" },
+		],
+	});
+	assert.equal(messagesWithExistingReminder.length, 1, "no duplicate reminder copies");
 
 	// Deleting the plan file ends the handoff: no more reminders.
 	fs.rmSync(path.join(tmpDir, "pi_plan.md"));
@@ -538,15 +549,11 @@ test("agent_end archives the consumed plan and stops adherence reminders", async
 		"the plan file is still on disk while the implementing run is active",
 	);
 
-	// The implementing run finishes: the consumed plan is archived and the
+	// The implementing phase settles: the consumed plan is archived and the
 	// adherence reminders stop.
-	for (const handler of agentEndHandlers) {
-		await handler(
-			{
-				messages: [{ message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }],
-			},
-			ctx,
-		);
+	const agentSettledHandlers = mock.events.get("agent_settled") ?? [];
+	for (const handler of agentSettledHandlers) {
+		await handler({}, ctx);
 	}
 
 	const archiveDir = path.join(tmpDir, ".pi", "plan");
@@ -564,7 +571,7 @@ test("agent_end archives the consumed plan and stops adherence reminders", async
 				messages: [
 					{
 						message: {
-							role: "tool",
+							role: "toolResult",
 							content: [{ type: "text", text: "tool result" }],
 						},
 					},
@@ -575,14 +582,9 @@ test("agent_end archives the consumed plan and stops adherence reminders", async
 	}
 	assert.equal(result.messages.length, 1, "no reminders once the plan is archived");
 
-	// A later agent_end outside the handoff is a no-op: nothing to archive again.
-	for (const handler of agentEndHandlers) {
-		await handler(
-			{
-				messages: [{ message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }],
-			},
-			ctx,
-		);
+	// A later settle outside the handoff is a no-op: nothing to archive again.
+	for (const handler of agentSettledHandlers) {
+		await handler({}, ctx);
 	}
 	assert.equal(fs.readdirSync(archiveDir).length, 1, "no duplicate archive entries");
 });
