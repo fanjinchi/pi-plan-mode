@@ -16,6 +16,18 @@ const TOOL_SELECTOR_PAGE_SIZE = 10;
 const PLAN_FILE_NAME = "pi_plan.md";
 const PLAN_PROGRESS_FILE_NAME = "plan.progress.md";
 const PLAN_ADHERENCE_MARKER = "[plan-adherence]";
+// The model declares the handoff finished by appending this marker to the plan
+// file (the bracketed plain-text variant counts too). Archiving keys off the
+// marker instead of the next agent_settled: settling only means pi will not
+// auto-continue, which is not the same as the implementation being done.
+const PLAN_DONE_MARKER = "<!-- plan-done -->";
+// Detection and stripping both accept the token anywhere on the file's last
+// non-empty line, because a model told to append the marker usually closes its
+// last sentence on that line ("Implementation finished. <!-- plan-done -->").
+// PLAN_DONE_TOKEN_PATTERN matches the token inside a line and must stay
+// non-global: a /g pattern keeps lastIndex state across .test() calls.
+const PLAN_DONE_TOKEN_PATTERN = /<!--[ \t]*plan-done[ \t]*-->|\[[ \t]*plan-done[ \t]*\]/i;
+const PLAN_DONE_TOKEN_GLOBAL_PATTERN = /<!--[ \t]*plan-done[ \t]*-->|\[[ \t]*plan-done[ \t]*\]/gi;
 // Consumed plans are archived under the project-local .pi/ directory (the
 // same convention pi uses for .pi/extensions, .pi/skills, .pi/prompts, ...)
 // so the working tree stays clean and past plans remain consultable.
@@ -23,6 +35,10 @@ const PLAN_ARCHIVE_DIR_NAME = path.join(".pi", "plan");
 // Shared step-tracking wording, used both by the one-time handoff message and
 // by the per-call adherence reminder so they cannot drift apart.
 const PLAN_PROGRESS_TRACKING_INSTRUCTION = `keep the steps checked off as you complete them, marking progress in the plan file itself or in a ${PLAN_PROGRESS_FILE_NAME} beside it`;
+// Shared completion wording: archiving waits for the marker to appear in the
+// plan file, so the handoff message and the reminder must ask for it in the
+// same words.
+const PLAN_DONE_DECLARATION_INSTRUCTION = `when the last step is done, append the exact line ${PLAN_DONE_MARKER} to ${PLAN_FILE_NAME} so the handoff is archived under ${PLAN_ARCHIVE_DIR_NAME}`;
 
 // Plans at or below this size are embedded verbatim in the implementation
 // message so they act as first-class instructions; larger plans stay on disk
@@ -107,6 +123,7 @@ const PLAN_COMMAND_COMPLETIONS: readonly CommandArgumentCompletion[] = [
 	{ value: "exit", label: "exit", description: "Leave Plan mode" },
 	{ value: "off", label: "off", description: "Leave Plan mode" },
 	{ value: "tools", label: "tools", description: "Select tools allowed in Plan mode" },
+	{ value: "done", label: "done", description: "Archive the plan of a finished handoff" },
 ];
 
 const PLAN_MODE_QUESTION_PARAMS = {
@@ -242,6 +259,9 @@ const PURE_READ_BASH_COMMANDS: ReadonlySet<string> = new Set([
 export default function planMode(pi: ExtensionAPI) {
 	let state: PlanModeState = { enabled: false, awaitingAction: false, implementing: false };
 	let previousTools: string[] | undefined;
+	// One hint per handoff when a settle arrives without the completion marker,
+	// so the user learns why the plan is still on disk instead of silence.
+	let planDoneHintShown = false;
 
 	pi.registerFlag("plan", {
 		description: "Start in Codex-like Plan mode",
@@ -300,6 +320,10 @@ export default function planMode(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const prompt = args.trim();
 			const command = prompt.toLowerCase();
+			if (command === "done" || command === "archive") {
+				archiveFinishedPlan(ctx);
+				return;
+			}
 			if (command === "exit" || command === "off") {
 				exitPlanMode(ctx);
 				ctx.ui.notify(`Plan mode disabled. ${PLAN_FILE_NAME} kept on disk.`, "info");
@@ -376,7 +400,8 @@ export default function planMode(pi: ExtensionAPI) {
 			if (typeof cwd !== "string") return { messages };
 			try {
 				if (!fs.existsSync(planFilePath(cwd))) {
-					// The plan file is gone, so the implementation handoff is over.
+					// The plan file was removed by hand (a marker-driven archive clears
+					// the flag itself), so the implementation handoff is over.
 					state = { ...state, implementing: false };
 					persistState();
 				} else {
@@ -438,16 +463,31 @@ export default function planMode(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		// Fired only when pi will not automatically continue (no retry,
-		// auto-compaction, or queued follow-up pending): the implementing
-		// phase has settled, so the consumed plan is archived and the
-		// adherence reminders stop. A settled handoff counts as consumed even
-		// on interruption — the archive under .pi/plan/ is the recoverable
-		// backup for that case.
+		// Settling only means pi will not continue this run automatically (no
+		// retry, auto-compaction, or queued follow-up left). It is NOT evidence
+		// that the implementation is finished: an implementing run ends whenever
+		// the model stops calling tools, which for a multi-step plan is usually
+		// well before the plan is done. The handoff therefore ends only once the
+		// model declared completion by writing PLAN_DONE_MARKER into the plan
+		// file; until then the plan stays on disk and the adherence reminders
+		// keep anchoring every call.
 		if (state.enabled || !state.implementing) return;
-		archivePlanFile(ctx);
+		if (!hasPlanDoneMarker(ctx.cwd)) {
+			notifyPlanDoneHint(ctx);
+			return;
+		}
+		// The handoff only ends once the plan really left the working tree: a
+		// failed archive keeps the reminders and the plan file in place.
+		if (!archivePlanFile(ctx)) {
+			notifyArchiveFailure(ctx);
+			return;
+		}
 		state = { ...state, implementing: false };
 		persistState();
+		ctx.ui.notify(
+			`${PLAN_FILE_NAME} marked as implemented and archived under ${PLAN_ARCHIVE_DIR_NAME}.`,
+			"info",
+		);
 	});
 
 	function enterPlanMode(ctx: ExtensionContext) {
@@ -488,6 +528,48 @@ export default function planMode(pi: ExtensionAPI) {
 		updateUi(ctx);
 	}
 
+	// Manual escape hatch: the marker is the model's job, so the user needs a
+	// way to archive a handoff the model never marked (or a leftover plan file).
+	// It also works while Plan mode is active; the plan the user asked to remove
+	// is simply gone from the working tree and planning continues.
+	function archiveFinishedPlan(ctx: ExtensionContext) {
+		const cwd = ctx.cwd;
+		const hasPlanFile =
+			typeof cwd === "string" &&
+			planSignalFilePaths(cwd).some((filePath) => fs.existsSync(filePath));
+		if (!hasPlanFile) {
+			ctx.ui.notify(`Nothing to archive: no ${PLAN_FILE_NAME} on disk.`, "info");
+			return;
+		}
+		if (!archivePlanFile(ctx)) {
+			notifyArchiveFailure(ctx);
+			return;
+		}
+		// The plan left the working tree, so neither a handoff nor a ready plan
+		// remains for the menu, the statusline, or the fallback handoff text.
+		state = { ...state, latestPlan: undefined, awaitingAction: false, implementing: false };
+		persistState();
+		updateUi(ctx);
+		const stillPlanning = state.enabled ? " Plan mode is still active." : "";
+		ctx.ui.notify(
+			`${PLAN_FILE_NAME} archived under ${PLAN_ARCHIVE_DIR_NAME}.${stillPlanning}`,
+			"info",
+		);
+	}
+
+	function notifyPlanDoneHint(ctx: ExtensionContext) {
+		if (planDoneHintShown) return;
+		planDoneHintShown = true;
+		ctx.ui.notify(
+			`${PLAN_FILE_NAME} stays on disk: the hand-off is not marked done yet. Run /plan done to archive it yourself once the implementation is over.`,
+			"info",
+		);
+	}
+
+	function notifyArchiveFailure(ctx: ExtensionContext) {
+		ctx.ui.notify(`Could not archive ${PLAN_FILE_NAME}; it stays in the working tree.`, "warning");
+	}
+
 	function sendPlanModeUserMessage(message: string, ctx: ExtensionContext) {
 		if (ctx.isIdle()) pi.sendUserMessage(message);
 		else pi.sendUserMessage(message, { deliverAs: "followUp" });
@@ -503,6 +585,16 @@ export default function planMode(pi: ExtensionAPI) {
 	}
 
 	function startImplementation(ctx: ExtensionContext, extraInput?: string) {
+		// A handoff starts unfinished: drop any marker an earlier handoff left
+		// behind (the same plan handed off again, or an archive that failed) so
+		// the next settle cannot archive on a stale completion signal.
+		if (!stripPlanDoneMarkers(ctx.cwd)) {
+			ctx.ui.notify(
+				`Could not clear a stale completion marker from ${PLAN_FILE_NAME}; it may archive this handoff early.`,
+				"warning",
+			);
+		}
+		planDoneHintShown = false;
 		const planFromFile = readPlanFile(ctx.cwd);
 		const plan = planFromFile ?? state.latestPlan?.trim();
 		exitPlanMode(ctx);
@@ -526,9 +618,10 @@ export default function planMode(pi: ExtensionAPI) {
 				? `Implement the plan in ${PLAN_FILE_NAME} in the working directory: read it now, then follow it faithfully, and re-read it whenever you need to check the exact steps.`
 				: `Implement this proposed plan now:\n\n${plan}`;
 		// Step-tracking + deviation handling: turns the plan into a checklist the
-		// model marks off as it goes and forces plan-first changes (Codex/Cursor
-		// style), plus a closing deviation report (Codex receipt style).
-		const adherenceGuidance = `\n\nWork through the plan step by step and ${PLAN_PROGRESS_TRACKING_INSTRUCTION}. If a step needs to change, update the plan first and note the deviation and why, then continue. When you are done, report any deviations from the plan and anything left unfinished. When the implementing phase ends, ${PLAN_FILE_NAME} is archived under ${PLAN_ARCHIVE_DIR_NAME} for reference.`;
+		// model marks off as it goes, forces plan-first changes (Codex/Cursor
+		// style), asks for the completion marker the archive trigger keys off, and
+		// closes with a deviation report (Codex receipt style).
+		const adherenceGuidance = `\n\nWork through the plan step by step and ${PLAN_PROGRESS_TRACKING_INSTRUCTION}; ${PLAN_DONE_DECLARATION_INSTRUCTION}. If a step needs to change, update the plan first and note the deviation and why, then continue. When you are done, report any deviations from the plan and anything left unfinished.`;
 		sendPlanModeUserMessage(
 			`Plan mode is now disabled. Full tool access is restored. ${planInstruction}${adherenceGuidance}${extra}`,
 			ctx,
@@ -1265,14 +1358,93 @@ export function readPlanFile(cwd: string): string | undefined {
 	}
 }
 
-function archivePlanFile(ctx: ExtensionContext) {
+// A handoff is complete only when the model says so in the plan file, so the
+// completion signal is read from disk instead of inferred from pi's event
+// lifecycle. The declaration may live in the plan file or in plan.progress.md,
+// whichever file the model used for progress tracking.
+function planSignalFilePaths(cwd: string): string[] {
+	// Guard before any path math: path.join on a non-string cwd would throw.
+	if (typeof cwd !== "string") return [];
+	return [planFilePath(cwd), path.join(cwd, PLAN_PROGRESS_FILE_NAME)];
+}
+
+// Mirrors isPlanFileTarget: never read or rewrite a plan file reached through a
+// symlink, so the extension does not touch whatever the link points at. A
+// missing file is not readable and therefore carries no declaration.
+function isReadablePlanSignalFile(filePath: string): boolean {
+	try {
+		return !fs.lstatSync(filePath).isSymbolicLink();
+	} catch {
+		return false;
+	}
+}
+
+type PlanDoneDeclaration = { lineIndex: number; line: string };
+
+// The declaration is the marker token on the file's last non-empty line: the
+// handoff asks the model to append it when the last step is done, and a model
+// closing its final sentence on that line still counts. Only the last line is
+// inspected so a marker the model merely quoted into the plan body (the
+// handoff prompt shows the bracketed form) cannot end the handoff early.
+function findPlanDoneDeclaration(filePath: string): PlanDoneDeclaration | undefined {
+	if (!isReadablePlanSignalFile(filePath)) return undefined;
+	try {
+		const lines = fs.readFileSync(filePath, "utf-8").split("\n");
+		for (let index = lines.length - 1; index >= 0; index -= 1) {
+			const line = lines[index] ?? "";
+			if (!line.trim()) continue;
+			return PLAN_DONE_TOKEN_PATTERN.test(line) ? { lineIndex: index, line } : undefined;
+		}
+		return undefined;
+	} catch {
+		// A missing or unreadable file carries no completion signal.
+		return undefined;
+	}
+}
+
+function hasPlanDoneMarker(cwd: string): boolean {
+	return planSignalFilePaths(cwd).some(
+		(filePath) => findPlanDoneDeclaration(filePath) !== undefined,
+	);
+}
+
+// True when no stale declaration is left behind. A new handoff must not archive
+// on the marker of the previous one, so the token is removed from the line that
+// declared it -- only the token, because the rest of that line is the model's
+// own closing words and has to survive the reset.
+function stripPlanDoneMarkers(cwd: string): boolean {
+	let clean = true;
+	for (const filePath of planSignalFilePaths(cwd)) {
+		const declaration = findPlanDoneDeclaration(filePath);
+		if (!declaration) continue;
+		try {
+			const lines = fs.readFileSync(filePath, "utf-8").split("\n");
+			const stripped = declaration.line.replace(PLAN_DONE_TOKEN_GLOBAL_PATTERN, "").trimEnd();
+			if (stripped) lines[declaration.lineIndex] = stripped;
+			else lines.splice(declaration.lineIndex, 1);
+			fs.writeFileSync(filePath, lines.join("\n"), "utf-8");
+		} catch (error) {
+			// The stale marker survived, so the next settle could archive this
+			// fresh handoff on it: report instead of failing silently.
+			clean = false;
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(`Plan mode could not clear the completion marker in ${filePath}: ${message}`);
+		}
+	}
+	return clean;
+}
+
+// True only when the plan really left the working tree: the callers gate their
+// state reset and success notification on it, so a failed archive keeps the
+// handoff open instead of reporting a success that did not happen.
+function archivePlanFile(ctx: ExtensionContext): boolean {
 	// Guard before any path math: path.join on a non-string cwd would throw
 	// outside the try/catch below.
-	if (typeof ctx.cwd !== "string") return;
+	if (typeof ctx.cwd !== "string") return false;
 	try {
 		const planPath = planFilePath(ctx.cwd);
 		const progressPath = path.join(ctx.cwd, PLAN_PROGRESS_FILE_NAME);
-		if (!fs.existsSync(planPath) && !fs.existsSync(progressPath)) return;
+		if (!fs.existsSync(planPath) && !fs.existsSync(progressPath)) return false;
 		fs.mkdirSync(path.join(ctx.cwd, PLAN_ARCHIVE_DIR_NAME), { recursive: true });
 		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 		// Archive the plan file and, if the model created one, the progress
@@ -1289,9 +1461,11 @@ function archivePlanFile(ctx: ExtensionContext) {
 			);
 			fs.renameSync(sourcePath, archivedPath);
 		}
+		return true;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(`Plan mode archive failed: ${message}`);
+		return false;
 	}
 }
 
@@ -1354,7 +1528,7 @@ function buildAdherenceReminderMessage() {
 }
 
 function planAdherenceReminder() {
-	return `${PLAN_ADHERENCE_MARKER} You are implementing the plan in ${PLAN_FILE_NAME} in the working directory. Follow its steps and ${PLAN_PROGRESS_TRACKING_INSTRUCTION}. If a step must change, update the plan first and note the deviation and why. When done, report deviations and anything left unfinished.`;
+	return `${PLAN_ADHERENCE_MARKER} You are implementing the plan in ${PLAN_FILE_NAME} in the working directory. Follow its steps and ${PLAN_PROGRESS_TRACKING_INSTRUCTION}; ${PLAN_DONE_DECLARATION_INSTRUCTION}. If a step must change, update the plan first and note the deviation and why. When done, report deviations and anything left unfinished.`;
 }
 
 function messageText(content: unknown): string {
