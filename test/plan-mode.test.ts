@@ -13,6 +13,7 @@ import planMode, {
 	normalizePlanModeQuestionParams,
 	PLAN_EMBED_MAX_CHARS,
 	readPlanFile,
+	toolPolicyLabel,
 	withoutPlanModeQuestionTool,
 	withRequiredPlanModeTools,
 } from "../src/plan-mode.js";
@@ -49,6 +50,10 @@ test("tool selection allows safe built-ins and non-built-ins only", () => {
 	assert.equal(canSelectToolInPlanMode(builtinTool("read") as PlanTool), true);
 	assert.equal(canSelectToolInPlanMode(builtinTool("edit") as PlanTool), false);
 	assert.equal(canSelectToolInPlanMode(extensionTool("custom") as PlanTool), true);
+	// A shadowed edit/write is confined to the plan file, so it is not offered as
+	// a per-session choice either.
+	assert.equal(canSelectToolInPlanMode(extensionTool("edit") as PlanTool), false);
+	assert.equal(canSelectToolInPlanMode(extensionTool("write") as PlanTool), false);
 	assert.deepEqual(withRequiredPlanModeTools(["read", "plan_mode_question", "read"]), [
 		"read",
 		"edit",
@@ -81,14 +86,16 @@ test("isDefaultPlanModeTool covers safe tool names, context tools, and read-only
 	assert.equal(isDefaultPlanModeTool(extensionTool("lsp_diagnostics") as PlanTool), true);
 	assert.equal(isDefaultPlanModeTool(extensionTool("lsp_fix") as PlanTool), false);
 	assert.equal(isDefaultPlanModeTool(extensionTool("unrelated") as PlanTool), false);
-	// Delegation and read-only web access are default-on as well.
-	for (const name of ["push-task", "resume-task", "task-ask", "web_search", "web_fetch"]) {
+	// Delegation and read-only web access are default-on as well, but task-ask is
+	// not: pi-tree-like-subagent only exposes it inside a task branch.
+	for (const name of ["push-task", "resume-task", "web_search", "web_fetch"]) {
 		assert.equal(
 			isDefaultPlanModeTool(extensionTool(name) as PlanTool),
 			true,
 			`${name} is default-on`,
 		);
 	}
+	assert.equal(isDefaultPlanModeTool(extensionTool("task-ask") as PlanTool), false);
 	assert.equal(isDefaultPlanModeTool(extensionTool("mcp") as PlanTool), false);
 	assert.equal(isDefaultPlanModeTool(extensionTool("ask_user_question") as PlanTool), false);
 	// Safe names are matched by name, so an extension that replaces a built-in
@@ -98,6 +105,41 @@ test("isDefaultPlanModeTool covers safe tool names, context tools, and read-only
 	assert.equal(isDefaultPlanModeTool(extensionTool("find") as PlanTool), true);
 	assert.equal(isDefaultPlanModeTool(extensionTool("ls") as PlanTool), true);
 	assert.equal(isDefaultPlanModeTool(extensionTool("powershell") as PlanTool), false);
+});
+
+test("toolPolicyLabel reports the name-keyed policy for each tool group", () => {
+	type PlanTool = Parameters<typeof toolPolicyLabel>[0];
+	const extensionLabel = (name: string) => `user/extension ${path.join(os.tmpdir(), name)}`;
+	assert.equal(toolPolicyLabel(builtinTool("read") as PlanTool), "built-in");
+	assert.equal(toolPolicyLabel(builtinTool("bash") as PlanTool), "built-in limited");
+	assert.equal(toolPolicyLabel(builtinTool("powershell") as PlanTool), "built-in blocked");
+	assert.equal(toolPolicyLabel(builtinTool("edit") as PlanTool), "built-in plan-file only");
+	assert.equal(toolPolicyLabel(extensionTool("compress") as PlanTool), "context management");
+	assert.equal(
+		toolPolicyLabel(extensionTool("edit") as PlanTool),
+		`plan-file only: ${extensionLabel("edit")}`,
+		"a shadowed edit is reported as plan-file only, not as user risk",
+	);
+	// A replaced safe name shows as an extension default instead of disappearing
+	// behind a built-in label.
+	assert.equal(
+		toolPolicyLabel(extensionTool("grep") as PlanTool),
+		`extension default: ${extensionLabel("grep")}`,
+	);
+	assert.equal(
+		toolPolicyLabel(extensionTool("powershell") as PlanTool),
+		`command filtered: ${extensionLabel("powershell")}`,
+		"a shadowed shell is marked as filtered, not as an unbounded user risk",
+	);
+	assert.equal(
+		toolPolicyLabel(extensionTool("bash") as PlanTool),
+		`command filtered: ${extensionLabel("bash")}`,
+		"a shadowed bash is filtered too, not a plain extension default",
+	);
+	assert.equal(
+		toolPolicyLabel(extensionTool("mcp") as PlanTool),
+		`user risk: ${extensionLabel("mcp")}`,
+	);
 });
 
 test("context-management tools stay active by default in Plan mode", async (t) => {
@@ -145,9 +187,13 @@ test("context-management tools stay active by default in Plan mode", async (t) =
 	}
 	assert.ok(active.includes("lsp_diagnostics"), "read-only diagnostics are on by default");
 	assert.ok(!active.includes("lsp_fix"), "mutating lsp_fix stays a user-risk opt-in");
-	for (const name of ["push-task", "resume-task", "task-ask", "web_search", "web_fetch"]) {
+	for (const name of ["push-task", "resume-task", "web_search", "web_fetch"]) {
 		assert.ok(active.includes(name), `${name} is default-active in Plan mode`);
 	}
+	assert.ok(
+		!active.includes("task-ask"),
+		"task-ask stays off: the task plugin enables it inside a branch itself",
+	);
 	assert.ok(!active.includes("unrelated"), "unrelated extension tool stays disabled");
 	assert.ok(active.includes("edit"), "edit stays required for the plan file");
 	assert.ok(active.includes("write"), "write stays required for the plan file");
@@ -214,6 +260,7 @@ test("tool_call gating also applies to extension tools that take over edit/write
 			extensionTool("edit"),
 			extensionTool("write"),
 			extensionTool("bash"),
+			extensionTool("powershell"),
 		],
 	});
 	planMode(mock.pi);
@@ -265,6 +312,26 @@ test("tool_call gating also applies to extension tools that take over edit/write
 			bashReadOnly,
 			undefined,
 			"a read-only command stays allowed through a shadowed bash",
+		);
+
+		const powershellMutating = (await handler(
+			{ toolName: "powershell", input: { command: "Remove-Item -Recurse -Force build" } },
+			ctx,
+		)) as { block?: boolean };
+		assert.equal(
+			powershellMutating.block,
+			true,
+			"a shadowed powershell must be command-filtered too",
+		);
+
+		const powershellReadOnly = await handler(
+			{ toolName: "powershell", input: { command: "git status --short" } },
+			ctx,
+		);
+		assert.equal(
+			powershellReadOnly,
+			undefined,
+			"a read-only command stays allowed through a shadowed powershell",
 		);
 	}
 });

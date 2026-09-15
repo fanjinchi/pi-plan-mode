@@ -16,6 +16,10 @@ const PLAN_CONTEXT_MARKER = "[CODEX-LIKE PLAN MODE ACTIVE]";
 // search tool must stay available rather than silently vanish from the Plan-mode
 // tool set, so isDefaultPlanModeTool() consults this set for any provider.
 const SAFE_BUILTIN_PLAN_TOOLS = new Set(["read", "bash", "grep", "find", "ls"]);
+// Shell-shaped names whose input must pass the command allowlist in Plan mode.
+// Keyed on the name like the sets around it, so a shell an extension provides
+// cannot skip the filter by not being the built-in.
+const SHELL_TOOL_NAMES = new Set(["bash", "powershell"]);
 // Names Plan mode restricts to the plan file. Keyed on the tool NAME like the
 // safe set above: an extension that takes over edit/write (Pi allows built-in
 // overrides) must not become a way to write arbitrary files while planning.
@@ -73,21 +77,23 @@ const CONTEXT_MANAGEMENT_TOOL_NAMES: ReadonlySet<string> = new Set([
 // Extension tools that Plan mode enables by default next to the built-in safe
 // set. Three groups belong here: read-only diagnostics (lsp_diagnostics reports
 // problems without touching a file, while the mutating lsp_fix stays a
-// user-risk opt-in), delegation (push-task/resume-task/task-ask from
+// user-risk opt-in), delegation (push-task/resume-task from
 // pi-tree-like-subagent, which move work into an isolated task branch or suspend
-// it for an answer instead of doing it inline), and read-only web access
-// (web_search/web_fetch, which read external pages without changing anything at
-// home or remotely). A name in this list is default-selected for every new
-// Plan-mode session, so keep it to tools a planner can call without review.
+// it for an answer), and read-only web access (web_search/web_fetch, which read
+// external pages without changing anything at home or remotely). A name in this
+// list is default-selected for every new Plan-mode session, so keep it to tools a
+// planner can call without review.
 //
-// A delegated branch runs in its own session with its own tool policy: pushing
-// an implementation task from Plan mode still edits files in that branch, so the
-// write gate below constrains this session's calls, not the work it hands off.
+// A task branch is navigated inside this same session (pi-tree-like-subagent
+// calls ctx.navigateTree and then sends the task prompt), not started as a
+// separate session, so Plan mode's state, system prompt, and tool gates stay in
+// force there: delegation from Plan mode is for read-only research and review,
+// not for handing off implementation. task-ask is deliberately absent — the
+// plugin only exposes it inside a task branch and it throws on the mainline.
 const DEFAULT_EXTENSION_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"lsp_diagnostics",
 	"push-task",
 	"resume-task",
-	"task-ask",
 	"web_search",
 	"web_fetch",
 ]);
@@ -405,9 +411,9 @@ export default function planMode(pi: ExtensionAPI) {
 				reason: `Plan mode only allows writing to ${PLAN_FILE_NAME} in the working directory. Use /plan and choose implementation when the plan is ready.`,
 			};
 		}
-		// Name-keyed as well: a bash provided by a sandbox or wrapper extension must
+		// Name-keyed as well: a shell provided by a sandbox or wrapper extension must
 		// still pass the command allowlist.
-		if (event.toolName !== "bash") return;
+		if (!SHELL_TOOL_NAMES.has(event.toolName)) return;
 
 		const command = readCommand(event.input);
 		if (!isSafeCommand(command)) {
@@ -811,6 +817,11 @@ export default function planMode(pi: ExtensionAPI) {
 		applyPlanModeTools();
 	}
 
+	// Replaces the whole active set, including visibility another extension set for
+	// the current branch: pi-tree-like-subagent shows task-ask only inside a task
+	// branch, and this per-turn re-apply strips it again (Plan mode cannot tell that
+	// it is running in a delegated branch). Treat a change here as a change to
+	// cross-extension behaviour, not as a local refactor.
 	function applyPlanModeTools() {
 		pi.setActiveTools(planModeToolNames());
 	}
@@ -987,6 +998,9 @@ export function completePlanArguments(argumentPrefix: string): CommandArgumentCo
 }
 
 export function canSelectToolInPlanMode(tool: ToolInfo) {
+	// edit/write are not a per-session choice: Plan mode keeps them active for the
+	// plan file only, whatever provides them.
+	if (BLOCKED_PLAN_TOOL_NAMES.has(tool.name)) return false;
 	if (isBuiltinTool(tool)) return SAFE_BUILTIN_PLAN_TOOLS.has(tool.name);
 	return true;
 }
@@ -1028,18 +1042,27 @@ function formatToolChoice(tool: ToolInfo, selected: boolean, index: number) {
 	return `${marker} ${index + 1}. ${tool.name} (${toolPolicyLabel(tool)})`;
 }
 
-function toolPolicyLabel(tool: ToolInfo) {
+// Human-readable policy label for the `/plan tools` selector. Exported so the
+// name-keyed policy can be unit tested without driving the whole selector.
+export function toolPolicyLabel(tool: ToolInfo) {
 	if (isContextManagementTool(tool)) return "context management";
+	// Name-keyed like the gates: a tool that takes over edit/write is confined to
+	// the plan file whatever provides it, so it is not a user-risk choice.
+	if (BLOCKED_PLAN_TOOL_NAMES.has(tool.name)) {
+		return isBuiltinTool(tool)
+			? "built-in plan-file only"
+			: `plan-file only: ${toolSourceLabel(tool)}`;
+	}
 	// Genuine built-ins keep their built-in label; only an extension-provided
-	// on tool is reported as an extension default (a replaced safe name such as
+	// tool is reported as an extension default (a replaced safe name such as
 	// pi-fff's grep lands here and shows its npm source).
 	if (isBuiltinTool(tool)) {
-		if (!SAFE_BUILTIN_PLAN_TOOLS.has(tool.name)) {
-			if (tool.name === "edit" || tool.name === "write") return "built-in plan-file only";
-			return "built-in blocked";
-		}
+		if (!SAFE_BUILTIN_PLAN_TOOLS.has(tool.name)) return "built-in blocked";
 		return tool.name === "bash" ? "built-in limited" : "built-in";
 	}
+	// Shells are filtered whatever provides them, so they read as filtered instead
+	// of as an unfiltered extension default.
+	if (SHELL_TOOL_NAMES.has(tool.name)) return `command filtered: ${toolSourceLabel(tool)}`;
 	if (isDefaultPlanModeTool(tool)) return `extension default: ${toolSourceLabel(tool)}`;
 	return `user risk: ${toolSourceLabel(tool)}`;
 }
@@ -1243,9 +1266,9 @@ You are in Plan Mode, a Codex-like collaboration mode for producing a decision-c
 - Stay in Plan Mode until a developer or extension explicitly exits it.
 - Treat requests to implement as requests to plan the implementation; do not edit project files or carry out the plan.
 - Do not use update_plan/TODO tooling in Plan Mode; Plan Mode is conversational planning, not execution progress tracking.
-- Plan Mode manages built-in tool safety only. Safe tool names (\`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`) stay enabled even when an extension provides them, and these extension tools stay enabled by default too: context management (billion-context-pi: \`compress\`, \`decompress\`, \`search_context\`, \`acp_status\`; pi-context: \`context_checkpoint\`, \`context_timeline\`, \`context_compact\`), read-only diagnostics (\`lsp_diagnostics\`), delegation (\`push-task\`, \`resume-task\`, \`task-ask\`), and read-only web access (\`web_search\`, \`web_fetch\`); all other non-built-in tools are disabled by default and may be enabled by the user at their own risk.
+- Plan Mode enforces its tool policy by tool name, not by package. Safe tool names (\`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`) stay enabled even when an extension provides them, the shell names (\`bash\`, \`powershell\`) pass through the command allowlist however they are provided, and these extension tools stay enabled by default too: context management (billion-context-pi: \`compress\`, \`decompress\`, \`search_context\`, \`acp_status\`; pi-context: \`context_checkpoint\`, \`context_timeline\`, \`context_compact\`), read-only diagnostics (\`lsp_diagnostics\`), delegation (\`push-task\`, \`resume-task\`), and read-only web access (\`web_search\`, \`web_fetch\`); all other non-built-in tools are disabled by default and may be enabled by the user at their own risk. A task branch is navigated inside this same session, so Plan Mode's rules stay in force there: delegate read-only research, exploration, or review instead of the implementation itself. \`task-ask\` is not active inside a branch unless it was enabled from the tool selector before pushing.
 - Do not perform mutating actions on project files: no patching, no formatting that rewrites files, no dependency installation, no commits, no migrations.
-- The only writable file in Plan Mode is \`${PLAN_FILE_NAME}\` in the working directory. Use it as the plan document: create it with \`write\` or update it with \`edit\`.
+- The only writable file in Plan Mode is \`${PLAN_FILE_NAME}\` in the working directory. Use it as the plan document: create it with \`write\` or update it with \`edit\`. This restriction is keyed on the tool name, so it also covers an extension that takes over \`edit\` or \`write\`.
 
 ## Phase 1 — Ground in the environment
 
