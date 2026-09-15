@@ -75,12 +75,22 @@ test("isContextManagementTool recognizes ACP and pi-context tools by name", () =
 	assert.equal(isContextManagementTool(extensionTool("unrelated") as PlanTool), false);
 });
 
-test("isDefaultPlanModeTool covers safe tool names, context tools, and read-only diagnostics", () => {
+test("isDefaultPlanModeTool covers safe tool names, context tools, and read-only defaults", () => {
 	type PlanTool = Parameters<typeof isDefaultPlanModeTool>[0];
 	assert.equal(isDefaultPlanModeTool(extensionTool("compress") as PlanTool), true);
 	assert.equal(isDefaultPlanModeTool(extensionTool("lsp_diagnostics") as PlanTool), true);
 	assert.equal(isDefaultPlanModeTool(extensionTool("lsp_fix") as PlanTool), false);
 	assert.equal(isDefaultPlanModeTool(extensionTool("unrelated") as PlanTool), false);
+	// Delegation and read-only web access are default-on as well.
+	for (const name of ["push-task", "resume-task", "task-ask", "web_search", "web_fetch"]) {
+		assert.equal(
+			isDefaultPlanModeTool(extensionTool(name) as PlanTool),
+			true,
+			`${name} is default-on`,
+		);
+	}
+	assert.equal(isDefaultPlanModeTool(extensionTool("mcp") as PlanTool), false);
+	assert.equal(isDefaultPlanModeTool(extensionTool("ask_user_question") as PlanTool), false);
 	// Safe names are matched by name, so an extension that replaces a built-in
 	// (pi-fff replaces grep/find) keeps that capability enabled by default.
 	assert.equal(isDefaultPlanModeTool(builtinTool("read") as PlanTool), true);
@@ -101,6 +111,11 @@ test("context-management tools stay active by default in Plan mode", async (t) =
 			extensionTool("context_compact"),
 			extensionTool("lsp_diagnostics"),
 			extensionTool("lsp_fix"),
+			extensionTool("push-task"),
+			extensionTool("resume-task"),
+			extensionTool("task-ask"),
+			extensionTool("web_search"),
+			extensionTool("web_fetch"),
 			extensionTool("unrelated"),
 		],
 	});
@@ -130,6 +145,9 @@ test("context-management tools stay active by default in Plan mode", async (t) =
 	}
 	assert.ok(active.includes("lsp_diagnostics"), "read-only diagnostics are on by default");
 	assert.ok(!active.includes("lsp_fix"), "mutating lsp_fix stays a user-risk opt-in");
+	for (const name of ["push-task", "resume-task", "task-ask", "web_search", "web_fetch"]) {
+		assert.ok(active.includes(name), `${name} is default-active in Plan mode`);
+	}
 	assert.ok(!active.includes("unrelated"), "unrelated extension tool stays disabled");
 	assert.ok(active.includes("edit"), "edit stays required for the plan file");
 	assert.ok(active.includes("write"), "write stays required for the plan file");

@@ -71,11 +71,26 @@ const CONTEXT_MANAGEMENT_TOOL_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 // Extension tools that Plan mode enables by default next to the built-in safe
-// set. Only read-only diagnostics belong here: lsp_diagnostics reports problems
-// without touching a file, while the mutating lsp_fix stays a user-risk opt-in.
-// A name in this list is default-selected for every new Plan-mode session, so
-// keep it to tools a planner can call without review.
-const DEFAULT_EXTENSION_TOOL_NAMES: ReadonlySet<string> = new Set(["lsp_diagnostics"]);
+// set. Three groups belong here: read-only diagnostics (lsp_diagnostics reports
+// problems without touching a file, while the mutating lsp_fix stays a
+// user-risk opt-in), delegation (push-task/resume-task/task-ask from
+// pi-tree-like-subagent, which move work into an isolated task branch or suspend
+// it for an answer instead of doing it inline), and read-only web access
+// (web_search/web_fetch, which read external pages without changing anything at
+// home or remotely). A name in this list is default-selected for every new
+// Plan-mode session, so keep it to tools a planner can call without review.
+//
+// A delegated branch runs in its own session with its own tool policy: pushing
+// an implementation task from Plan mode still edits files in that branch, so the
+// write gate below constrains this session's calls, not the work it hands off.
+const DEFAULT_EXTENSION_TOOL_NAMES: ReadonlySet<string> = new Set([
+	"lsp_diagnostics",
+	"push-task",
+	"resume-task",
+	"task-ask",
+	"web_search",
+	"web_fetch",
+]);
 
 interface CommandArgumentCompletion {
 	value: string;
@@ -1228,7 +1243,7 @@ You are in Plan Mode, a Codex-like collaboration mode for producing a decision-c
 - Stay in Plan Mode until a developer or extension explicitly exits it.
 - Treat requests to implement as requests to plan the implementation; do not edit project files or carry out the plan.
 - Do not use update_plan/TODO tooling in Plan Mode; Plan Mode is conversational planning, not execution progress tracking.
-- Plan Mode manages built-in tool safety only. Safe tool names (\`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`) stay enabled even when an extension provides them, context-management tools (billion-context-pi: \`compress\`, \`decompress\`, \`search_context\`, \`acp_status\`; pi-context: \`context_checkpoint\`, \`context_timeline\`, \`context_compact\`) and read-only diagnostics (\`lsp_diagnostics\`) stay enabled by default; all other non-built-in tools are disabled by default and may be enabled by the user at their own risk.
+- Plan Mode manages built-in tool safety only. Safe tool names (\`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`) stay enabled even when an extension provides them, and these extension tools stay enabled by default too: context management (billion-context-pi: \`compress\`, \`decompress\`, \`search_context\`, \`acp_status\`; pi-context: \`context_checkpoint\`, \`context_timeline\`, \`context_compact\`), read-only diagnostics (\`lsp_diagnostics\`), delegation (\`push-task\`, \`resume-task\`, \`task-ask\`), and read-only web access (\`web_search\`, \`web_fetch\`); all other non-built-in tools are disabled by default and may be enabled by the user at their own risk.
 - Do not perform mutating actions on project files: no patching, no formatting that rewrites files, no dependency installation, no commits, no migrations.
 - The only writable file in Plan Mode is \`${PLAN_FILE_NAME}\` in the working directory. Use it as the plan document: create it with \`write\` or update it with \`edit\`.
 
