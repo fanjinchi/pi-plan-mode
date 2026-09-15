@@ -19,9 +19,9 @@ Pi core intentionally does not ship a built-in plan mode; this package provides 
 
 - Adds `/plan` to enter or manage Plan mode.
 - Adds `--plan` to start a session in Plan mode.
-- Enables built-in read-only tools by default while Plan mode is active.
+- Enables read-only tools by default while Plan mode is active: `read`, limited `bash`, `grep`, `find`, and `ls` are matched by tool name, so an extension that replaces one of them (pi-fff's `grep`/`find`) keeps the capability instead of silently losing it.
 - Unlocks `write` and `edit` tools in Plan mode, but only for the plan file (`pi_plan.md`); all other file mutations are blocked.
-- Disables extension and custom tools by default, with a `/plan tools` selector for explicit user-risk opt-in; context-management tools (`compress`, `decompress`, `search_context`, `acp_status` from billion-context-pi; `context_checkpoint`, `context_timeline`, `context_compact` from pi-context) are treated as safe — they only read/rewrite session conversation, never project files — and stay enabled by default.
+- Disables extension and custom tools by default, with a `/plan tools` selector for explicit user-risk opt-in; context-management tools (`compress`, `decompress`, `search_context`, `acp_status` from billion-context-pi; `context_checkpoint`, `context_timeline`, `context_compact` from pi-context) stay enabled by default because they only read/rewrite session conversation, and the read-only `lsp_diagnostics` joins them; its mutating sibling `lsp_fix` stays opt-in.
 - Blocks mutating built-in tools and bash commands such as `rm`, `git commit`, dependency installs, redirects, and editor launches.
 - Injects Codex-like Plan mode instructions: explore first, ask decision questions for high-impact ambiguity, do not mutate project files, and finish by writing the plan to `pi_plan.md` only when decision-complete.
 - Adds a required `plan_mode_question` tool so the agent can ask structured Plan-mode questions before finalizing a plan.
@@ -72,9 +72,11 @@ Use `/plan` to enter Plan mode before writing your planning prompt. Use `/plan <
 
 When Plan mode is active, ask the agent to design the change. The agent may inspect files and run read-only commands, but it should not edit project files or execute the implementation. It should explore first, then use structured questions when your preference or a tradeoff materially changes the plan.
 
-By default, Plan mode manages only Pi's built-in tools: `read`, limited `bash`, available read-only built-ins such as `grep`, `find`, and `ls`, plus the required `plan_mode_question` tool. Built-in `edit` and `write` are also active but gated to `pi_plan.md` only. Extension and custom tools are disabled by default because Pi tools do not expose standardized mutability metadata; enable them from `/plan tools` only when you accept the risk for that session. For example, you can opt into `firecrawl_scrape`, `firecrawl_search`, or `biome_lsp_diagnostics` if those extensions are loaded and you want to use them during planning.
+By default, Plan mode manages only Pi's built-in tools: `read`, limited `bash`, available read-only built-ins such as `grep`, `find`, and `ls`, plus the required `plan_mode_question` tool. The safe set is matched by tool name rather than by package: an extension may replace a built-in by registering the same name (pi-fff replaces `grep` and `find`, so their `sourceInfo.source` is no longer `builtin`), and such a replacement of a safe name stays active. Built-in `edit` and `write` are also active but gated to `pi_plan.md` only. Extension and custom tools are disabled by default because Pi tools do not expose standardized mutability metadata; enable them from `/plan tools` only when you accept the risk for that session. For example, you can opt into `firecrawl_scrape`, `firecrawl_search`, `lsp_fix`, or `biome_lsp_diagnostics` if those extensions are loaded and you want to use them during planning.
 
 Context-management extensions are the deliberate exception: their tools never touch project files or external systems, only the session conversation. Plan mode therefore enables them by default and labels them `context management` in the `/plan tools` selector (where you can still toggle them off). Currently recognized: billion-context-pi's `compress`, `decompress`, `search_context`, `acp_status` and pi-context's `context_checkpoint`, `context_timeline`, `context_compact`. During long planning sessions the agent can use them to fold consumed exploration and anchor phases instead of letting context grow unmanaged.
+
+Read-only diagnostics are the second exception: `lsp_diagnostics` (from `@narumitw/pi-lsp`) only reports problems and never rewrites a file, so Plan mode enables it by default and labels it `extension default` in the selector. Its sibling `lsp_fix` applies source fixes and therefore stays a user-risk opt-in.
 
 `plan_mode_question` follows Codex's `request_user_input` pattern: the agent can ask 1-3 concise questions, each with meaningful options and a free-form Other path. If you cancel or no interactive UI is available, the agent should ask a concise plain-text question or proceed only with a clearly stated low-risk assumption instead of prematurely producing a final plan.
 
@@ -118,7 +120,7 @@ This extension maps Codex's `ModeKind::Plan` behavior onto Pi's extension API:
 - The agent should use `plan_mode_question` for important non-discoverable preferences or tradeoffs before finalizing.
 - `update_plan`-style checklist use is discouraged while Plan mode is active.
 - The implementation boundary is explicit: Plan mode restores tools before starting implementation, choosing implementation immediately triggers a normal agent turn with full tool access, and plain exit/off keeps `pi_plan.md` on disk.
-- Pi extension safety is approximated with built-in tool restriction plus bash filtering; non-built-in tools are user-selected at user risk because Plan mode does not classify extension/custom tool behavior.
+- Pi extension safety is approximated with write restriction plus bash filtering, both keyed on the tool name: anything named `edit`/`write` may only touch `pi_plan.md` and anything named `bash` must pass the command allowlist, even when an extension provides it. Other non-built-in tools are user-selected at user risk because Plan mode does not classify extension/custom tool behavior.
 
 ## 🗂️ Package layout
 

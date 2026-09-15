@@ -7,6 +7,7 @@ import planMode, {
 	canSelectToolInPlanMode,
 	completePlanArguments,
 	isContextManagementTool,
+	isDefaultPlanModeTool,
 	isPlanFileTarget,
 	isSafeCommand,
 	normalizePlanModeQuestionParams,
@@ -74,6 +75,21 @@ test("isContextManagementTool recognizes ACP and pi-context tools by name", () =
 	assert.equal(isContextManagementTool(extensionTool("unrelated") as PlanTool), false);
 });
 
+test("isDefaultPlanModeTool covers safe tool names, context tools, and read-only diagnostics", () => {
+	type PlanTool = Parameters<typeof isDefaultPlanModeTool>[0];
+	assert.equal(isDefaultPlanModeTool(extensionTool("compress") as PlanTool), true);
+	assert.equal(isDefaultPlanModeTool(extensionTool("lsp_diagnostics") as PlanTool), true);
+	assert.equal(isDefaultPlanModeTool(extensionTool("lsp_fix") as PlanTool), false);
+	assert.equal(isDefaultPlanModeTool(extensionTool("unrelated") as PlanTool), false);
+	// Safe names are matched by name, so an extension that replaces a built-in
+	// (pi-fff replaces grep/find) keeps that capability enabled by default.
+	assert.equal(isDefaultPlanModeTool(builtinTool("read") as PlanTool), true);
+	assert.equal(isDefaultPlanModeTool(extensionTool("grep") as PlanTool), true);
+	assert.equal(isDefaultPlanModeTool(extensionTool("find") as PlanTool), true);
+	assert.equal(isDefaultPlanModeTool(extensionTool("ls") as PlanTool), true);
+	assert.equal(isDefaultPlanModeTool(extensionTool("powershell") as PlanTool), false);
+});
+
 test("context-management tools stay active by default in Plan mode", async (t) => {
 	const mock = createMockPi({
 		activeTools: ["read", "bash", "compress", "context_compact"],
@@ -83,6 +99,8 @@ test("context-management tools stay active by default in Plan mode", async (t) =
 			extensionTool("compress"),
 			extensionTool("search_context"),
 			extensionTool("context_compact"),
+			extensionTool("lsp_diagnostics"),
+			extensionTool("lsp_fix"),
 			extensionTool("unrelated"),
 		],
 	});
@@ -110,10 +128,127 @@ test("context-management tools stay active by default in Plan mode", async (t) =
 	for (const name of ["compress", "search_context", "context_compact", "read", "bash"]) {
 		assert.ok(active.includes(name), `${name} should be active in Plan mode by default`);
 	}
+	assert.ok(active.includes("lsp_diagnostics"), "read-only diagnostics are on by default");
+	assert.ok(!active.includes("lsp_fix"), "mutating lsp_fix stays a user-risk opt-in");
 	assert.ok(!active.includes("unrelated"), "unrelated extension tool stays disabled");
 	assert.ok(active.includes("edit"), "edit stays required for the plan file");
 	assert.ok(active.includes("write"), "write stays required for the plan file");
 	assert.ok(active.includes("plan_mode_question"));
+});
+
+test("safe tool names stay default-active when an extension replaces the built-in", async (t) => {
+	// pi-fff registers grep/find itself, so their sourceInfo.source flips from
+	// "builtin" to "npm" after session_start. Plan mode keys the safe set on the
+	// tool name, so a replaced search tool must stay enabled instead of silently
+	// disappearing on the next apply.
+	const mock = createMockPi({
+		activeTools: ["read", "bash", "grep", "find"],
+		allTools: [
+			builtinTool("read"),
+			builtinTool("bash"),
+			extensionTool("grep"),
+			extensionTool("find"),
+			extensionTool("ls"),
+			extensionTool("powershell"),
+			extensionTool("unrelated"),
+		],
+	});
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+	const { ctx } = createMockContext({
+		cwd: tmpDir,
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	const active = mock.rawPi.getActiveTools();
+	for (const name of ["read", "bash", "grep", "find", "ls"]) {
+		assert.ok(active.includes(name), `${name} should stay active when an extension provides it`);
+	}
+	assert.ok(
+		!active.includes("powershell"),
+		"a shadowed non-safe name stays out of the default set",
+	);
+	assert.ok(!active.includes("unrelated"), "unrelated extension tool stays disabled");
+});
+
+test("tool_call gating also applies to extension tools that take over edit/write/bash", async (t) => {
+	// Sandbox and wrapper extensions re-register built-in names; their edit/write
+	// must stay locked to the plan file and their bash must still pass the
+	// command allowlist, exactly like the built-ins they replace.
+	const mock = createMockPi({
+		activeTools: ["read", "grep"],
+		allTools: [
+			extensionTool("read"),
+			extensionTool("grep"),
+			extensionTool("edit"),
+			extensionTool("write"),
+			extensionTool("bash"),
+		],
+	});
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+	const { ctx } = createMockContext({
+		cwd: tmpDir,
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	const toolCallHandlers = mock.events.get("tool_call") ?? [];
+
+	for (const handler of toolCallHandlers) {
+		const writePlan = await handler(
+			{ toolName: "write", input: { path: "pi_plan.md", content: "# Plan" } },
+			ctx,
+		);
+		assert.equal(writePlan, undefined, "a shadowed write may still target pi_plan.md");
+
+		const editSource = (await handler(
+			{ toolName: "edit", input: { path: "src/index.ts", oldText: "a", newText: "b" } },
+			ctx,
+		)) as { block?: boolean };
+		assert.equal(editSource.block, true, "a shadowed edit must not write project files");
+
+		const bashMutating = (await handler(
+			{ toolName: "bash", input: { command: "rm -rf build" } },
+			ctx,
+		)) as { block?: boolean };
+		assert.equal(bashMutating.block, true, "a shadowed bash must still be command-filtered");
+
+		const bashReadOnly = await handler(
+			{ toolName: "bash", input: { command: "git status --short" } },
+			ctx,
+		);
+		assert.equal(
+			bashReadOnly,
+			undefined,
+			"a read-only command stays allowed through a shadowed bash",
+		);
+	}
 });
 
 test("isSafeCommand permits read-only commands and blocks mutating commands", () => {

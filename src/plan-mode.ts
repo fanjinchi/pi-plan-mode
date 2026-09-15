@@ -9,8 +9,17 @@ const PLAN_CONTEXT_MESSAGE_TYPE = "plan-mode-context";
 const PROPOSED_PLAN_MESSAGE_TYPE = "proposed-plan";
 const PLAN_MODE_QUESTION_TOOL_NAME = "plan_mode_question";
 const PLAN_CONTEXT_MARKER = "[CODEX-LIKE PLAN MODE ACTIVE]";
+// Safe-by-name Plan-mode tool set. These are keyed on the tool NAME, not on the
+// package that provides them: pi lets an extension replace a built-in by
+// registering the same name (pi-fff replaces grep/find, and their
+// sourceInfo.source is then "npm" instead of "builtin"). A replaced read-only
+// search tool must stay available rather than silently vanish from the Plan-mode
+// tool set, so isDefaultPlanModeTool() consults this set for any provider.
 const SAFE_BUILTIN_PLAN_TOOLS = new Set(["read", "bash", "grep", "find", "ls"]);
-const BLOCKED_BUILTIN_TOOLS = new Set(["edit", "write"]);
+// Names Plan mode restricts to the plan file. Keyed on the tool NAME like the
+// safe set above: an extension that takes over edit/write (Pi allows built-in
+// overrides) must not become a way to write arbitrary files while planning.
+const BLOCKED_PLAN_TOOL_NAMES = new Set(["edit", "write"]);
 const DEFAULT_TOOLS = ["read", "bash", "edit", "write"];
 const TOOL_SELECTOR_PAGE_SIZE = 10;
 const PLAN_FILE_NAME = "pi_plan.md";
@@ -60,6 +69,13 @@ const CONTEXT_MANAGEMENT_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"context_timeline",
 	"context_compact",
 ]);
+
+// Extension tools that Plan mode enables by default next to the built-in safe
+// set. Only read-only diagnostics belong here: lsp_diagnostics reports problems
+// without touching a file, while the mutating lsp_fix stays a user-risk opt-in.
+// A name in this list is default-selected for every new Plan-mode session, so
+// keep it to tools a planner can call without review.
+const DEFAULT_EXTENSION_TOOL_NAMES: ReadonlySet<string> = new Set(["lsp_diagnostics"]);
 
 interface CommandArgumentCompletion {
 	value: string;
@@ -367,14 +383,16 @@ export default function planMode(pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (!state.enabled) return;
-		if (isBlockedBuiltinToolName(event.toolName)) {
+		if (isBlockedPlanToolName(event.toolName)) {
 			if (isPlanFileTarget(ctx.cwd, event.input)) return;
 			return {
 				block: true,
 				reason: `Plan mode only allows writing to ${PLAN_FILE_NAME} in the working directory. Use /plan and choose implementation when the plan is ready.`,
 			};
 		}
-		if (event.toolName !== "bash" || !isBuiltinToolName(event.toolName)) return;
+		// Name-keyed as well: a bash provided by a sandbox or wrapper extension must
+		// still pass the command allowlist.
+		if (event.toolName !== "bash") return;
 
 		const command = readCommand(event.input);
 		if (!isSafeCommand(command)) {
@@ -734,7 +752,7 @@ export default function planMode(pi: ExtensionAPI) {
 				doneChoice,
 			];
 			const choice = await ctx.ui.select(
-				`Plan-mode tools (${pageIndex + 1}/${pageCount}). Context-management tools are on by default; other non-built-in tools run at user risk.`,
+				`Plan-mode tools (${pageIndex + 1}/${pageCount}). Context-management and extension-default tools are on by default; other non-built-in tools run at user risk.`,
 				[...choices, ...navigationChoices],
 			);
 			if (!choice || choice === doneChoice) break;
@@ -807,13 +825,7 @@ export default function planMode(pi: ExtensionAPI) {
 	}
 
 	function defaultPlanModeToolNames(tools: ToolInfo[]) {
-		return tools
-			.filter(
-				(tool) =>
-					(isBuiltinTool(tool) && SAFE_BUILTIN_PLAN_TOOLS.has(tool.name)) ||
-					isContextManagementTool(tool),
-			)
-			.map((tool) => tool.name);
+		return tools.filter(isDefaultPlanModeTool).map((tool) => tool.name);
 	}
 
 	function migrateSelectedToolKeys(tools: ToolInfo[]) {
@@ -941,19 +953,8 @@ export default function planMode(pi: ExtensionAPI) {
 		return `Tools: ${names.length > 0 ? names.join(", ") : "none"}`;
 	}
 
-	function isBlockedBuiltinToolName(toolName: string) {
-		if (!BLOCKED_BUILTIN_TOOLS.has(toolName)) return false;
-		const tool = toolByName(toolName);
-		return tool ? isBuiltinTool(tool) : true;
-	}
-
-	function isBuiltinToolName(toolName: string) {
-		const tool = toolByName(toolName);
-		return tool ? isBuiltinTool(tool) : toolName === "bash";
-	}
-
-	function toolByName(toolName: string) {
-		return safeGetAllTools().find((candidate) => candidate.name === toolName);
+	function isBlockedPlanToolName(toolName: string) {
+		return BLOCKED_PLAN_TOOL_NAMES.has(toolName);
 	}
 }
 
@@ -979,6 +980,20 @@ export function isContextManagementTool(tool: ToolInfo) {
 	return CONTEXT_MANAGEMENT_TOOL_NAMES.has(tool.name);
 }
 
+// True for the tools Plan mode turns on without a per-session opt-in: the safe
+// names from SAFE_BUILTIN_PLAN_TOOLS (matched by name, so a tool an extension
+// substituted for a built-in such as grep or find stays available), the
+// context-management tools, and the read-only extensions listed in
+// DEFAULT_EXTENSION_TOOL_NAMES. Everything else stays user-selected, because Pi
+// tool metadata carries no mutability flag to classify it automatically.
+export function isDefaultPlanModeTool(tool: ToolInfo) {
+	return (
+		SAFE_BUILTIN_PLAN_TOOLS.has(tool.name) ||
+		isContextManagementTool(tool) ||
+		DEFAULT_EXTENSION_TOOL_NAMES.has(tool.name)
+	);
+}
+
 function toolNameFromLegacyKey(key: string, tools: ToolInfo[]) {
 	const directName = tools.find((tool) => tool.name === key)?.name;
 	if (directName) return directName;
@@ -1000,6 +1015,9 @@ function formatToolChoice(tool: ToolInfo, selected: boolean, index: number) {
 
 function toolPolicyLabel(tool: ToolInfo) {
 	if (isContextManagementTool(tool)) return "context management";
+	// Genuine built-ins keep their built-in label; only an extension-provided
+	// on tool is reported as an extension default (a replaced safe name such as
+	// pi-fff's grep lands here and shows its npm source).
 	if (isBuiltinTool(tool)) {
 		if (!SAFE_BUILTIN_PLAN_TOOLS.has(tool.name)) {
 			if (tool.name === "edit" || tool.name === "write") return "built-in plan-file only";
@@ -1007,6 +1025,7 @@ function toolPolicyLabel(tool: ToolInfo) {
 		}
 		return tool.name === "bash" ? "built-in limited" : "built-in";
 	}
+	if (isDefaultPlanModeTool(tool)) return `extension default: ${toolSourceLabel(tool)}`;
 	return `user risk: ${toolSourceLabel(tool)}`;
 }
 
@@ -1209,7 +1228,7 @@ You are in Plan Mode, a Codex-like collaboration mode for producing a decision-c
 - Stay in Plan Mode until a developer or extension explicitly exits it.
 - Treat requests to implement as requests to plan the implementation; do not edit project files or carry out the plan.
 - Do not use update_plan/TODO tooling in Plan Mode; Plan Mode is conversational planning, not execution progress tracking.
-- Plan Mode manages built-in tool safety only. Context-management tools (billion-context-pi: \`compress\`, \`decompress\`, \`search_context\`, \`acp_status\`; pi-context: \`context_checkpoint\`, \`context_timeline\`, \`context_compact\`) stay enabled by default; all other non-built-in tools are disabled by default and may be enabled by the user at their own risk.
+- Plan Mode manages built-in tool safety only. Safe tool names (\`read\`, \`bash\`, \`grep\`, \`find\`, \`ls\`) stay enabled even when an extension provides them, context-management tools (billion-context-pi: \`compress\`, \`decompress\`, \`search_context\`, \`acp_status\`; pi-context: \`context_checkpoint\`, \`context_timeline\`, \`context_compact\`) and read-only diagnostics (\`lsp_diagnostics\`) stay enabled by default; all other non-built-in tools are disabled by default and may be enabled by the user at their own risk.
 - Do not perform mutating actions on project files: no patching, no formatting that rewrites files, no dependency installation, no commits, no migrations.
 - The only writable file in Plan Mode is \`${PLAN_FILE_NAME}\` in the working directory. Use it as the plan document: create it with \`write\` or update it with \`edit\`.
 
