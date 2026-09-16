@@ -394,6 +394,10 @@ test("powershell gating uses the PowerShell allowlist dialect", async (t) => {
 			// read-only cmdlet stays allowed.
 			"Get-Help Get-Content",
 			"Get-CimInstance -ClassName Win32_OperatingSystem",
+			// The widened shared allowlist reaches this dialect too: a native form that
+			// the POSIX judge now accepts is accepted here.
+			"git rev-parse HEAD",
+			"nl -ba pi_plan.md",
 			// These read aliases exist only in the PowerShell allowlist (the POSIX
 			// fallback does not know them), so the rows pin those entries.
 			"sls -Pattern status pi_plan.md",
@@ -469,7 +473,15 @@ test("powershell gating uses the PowerShell allowlist dialect", async (t) => {
 			"git branch -D main",
 			"git remote add origin http://x",
 			"git log --output=/tmp/x.txt",
+			// Quoting the flag does not stop git from consuming it, so the check reads the
+			// raw segment. The cost is a quoted literal that merely spells `--output=`.
+			'git log "--output=/tmp/x" f',
+			"git diff '--output' /tmp/x",
 			"sed -n -i 's/a/Z/' f",
+			// The escapes the widened guards close are shared, not POSIX-only.
+			"sed -n 'w /tmp/x' f",
+			"find src -fprintf /tmp/x '%p'",
+			"awk -f prog.awk f",
 		]) {
 			assert.equal((await run(command))?.block, true, `powershell must block: ${command}`);
 		}
@@ -528,6 +540,47 @@ test("the shared command judge refuses path-shaped heads and mutating git/sed fo
 			"git remote -v",
 			"git remote show origin",
 			"sed -n '1,20p' f",
+			"sed -n '$p' f",
+			"sed -n '1p;5p' f",
+			// Read-only evidence tools: git plumbing (none of these writes a ref or a
+			// file) and stdout-only text/checksum tools. `--output`, the one
+			// file-writing flag in the git family, was already refused before them.
+			"git rev-parse HEAD",
+			"git blame src/index.ts",
+			"git ls-tree -r HEAD",
+			"git cat-file -p HEAD:src/index.ts",
+			"git for-each-ref",
+			"git describe --tags",
+			"git shortlog -sn",
+			"git rev-list --count HEAD",
+			"git show-ref",
+			"git reflog",
+			"git reflog show main",
+			"git stash list",
+			"git tag -l",
+			"git tag --list 'v*'",
+			"git worktree list",
+			"git submodule status",
+			"nl -ba f",
+			"cmp a b",
+			"od -c f",
+			"hexdump -C f",
+			"readlink -f x",
+			"realpath .",
+			"sha256sum f",
+			"strings f",
+			"cut -d: -f1 f",
+			"tr -d 'a'",
+			"comm a b",
+			"seq 1 10",
+			"tac f",
+			"basename /a/b",
+			"dirname /a/b",
+			"expr 1 + 1",
+			"test -f f",
+			// `grep -f patterns.txt` reads the pattern file and greps, so it stays
+			// allowed even though other tools' file-writing flags are refused.
+			"grep -f patterns.txt f",
 		]) {
 			for (const toolName of ["bash", "powershell"]) {
 				assert.equal(
@@ -556,6 +609,41 @@ test("the shared command judge refuses path-shaped heads and mutating git/sed fo
 			"sed -n -i 's/a/Z/' f",
 			"sed --in-place 's/a/b/' f",
 			"sed -n -f script.sed f",
+			// Listing forms that share a name with a mutating subcommand, plus the git
+			// subcommands that have their own write mode.
+			"git reflog delete HEAD@{1}",
+			"git reflog expire --all",
+			"git stash",
+			"git stash push -m x",
+			"git tag -d v1",
+			"git tag -a v1 -m x",
+			"git tag -l --delete v1",
+			"git worktree add ../x",
+			"git submodule update --init",
+			// `git symbolic-ref HEAD refs/heads/other` would write `.git/HEAD`, so it
+			// is deliberately missing from the plumbing allowlist.
+			"git symbolic-ref HEAD refs/heads/other",
+			"git config --list",
+			"git fetch origin",
+			"git archive -o /tmp/x.tar HEAD",
+			// The scripts and flags that write or run a program, refused by the
+			// print-only sed grammar and the sort/awk/find guards.
+			"sed -n 'w /tmp/x' f",
+			"sed -n 's/a/b/w out' f",
+			"sed -n 's/a/b/e' f",
+			"sed -n '1e touch /tmp/x' f",
+			"sed -n -e '1p' f",
+			// The known cost of a print-only grammar: a regex address is refused, so
+			// `grep -n` plus a file read is how to look around a match.
+			"sed -n '/x/p' f",
+			"find src -fprintf /tmp/x '%p'",
+			"find src -fls /tmp/x",
+			"find . -execdir rm {} +",
+			"awk -f prog.awk f",
+			'awk "-f" prog.awk f',
+			// `xxd` is not allowlisted at all: its second positional argument is an
+			// output file, so `od -c` is the byte view instead.
+			"xxd f",
 		]) {
 			for (const toolName of ["bash", "powershell"]) {
 				assert.equal(
@@ -565,6 +653,20 @@ test("the shared command judge refuses path-shaped heads and mutating git/sed fo
 				);
 			}
 		}
+
+		// `sort` is a PowerShell alias for `Sort-Object`, so this dialect resolves it
+		// as a cmdlet and never reaches the shared guard; the guard's row therefore
+		// belongs to `bash` alone.
+		assert.equal(
+			(await run("bash", "sort -o /tmp/x f"))?.block,
+			true,
+			"bash must block: sort -o /tmp/x f",
+		);
+		assert.equal(
+			(await run("bash", "sort --compress-program=rm f"))?.block,
+			true,
+			"bash must block: sort --compress-program=rm f",
+		);
 	}
 });
 
@@ -610,6 +712,12 @@ test("isSafeCommand refuses path-shaped heads, mutating git forms, and in-place 
 	// `--output` writes a file in git log/diff/show.
 	assert.equal(isSafeCommand("git log --output=/tmp/x.txt"), false);
 	assert.equal(isSafeCommand("git diff --output /tmp/x.txt"), false);
+	// Quoting the flag does not make it data, so the check reads the raw segment.
+	assert.equal(isSafeCommand('git log "--output=/tmp/x" f'), false);
+	assert.equal(isSafeCommand("git diff '--output' /tmp/x"), false);
+	assert.equal(isSafeCommand('git log -- "--output" f'), false);
+	// The known cost of that: a quoted literal that merely spells `--output=`.
+	assert.equal(isSafeCommand('grep -rn "--output=" .'), false);
 
 	// sed rewrites in place with `-i` in any combination, and `-f` runs a script.
 	assert.equal(isSafeCommand("sed -n '1,20p' f"), true);
@@ -619,8 +727,98 @@ test("isSafeCommand refuses path-shaped heads, mutating git forms, and in-place 
 	assert.equal(isSafeCommand("sed -i.bak 's/a/b/' f"), false);
 	assert.equal(isSafeCommand("sed --in-place 's/a/b/' f"), false);
 	assert.equal(isSafeCommand("sed -n -f script.sed f"), false);
-	// A quoted script that merely mentions `-i` is not a flag.
-	assert.equal(isSafeCommand("sed -n 's/-i/x/p' f"), true);
+	// A quoted script that merely mentions `-i` is not a flag — but substitution is
+	// no longer allowlisted at all: only print scripts pass the grammar, so this row
+	// now pins the narrowing instead of the quoting rule it used to pin.
+	assert.equal(isSafeCommand("sed -n 's/-i/x/p' f"), false);
+});
+
+test("isSafeCommand allows read-only evidence tools and refuses their writing flags", () => {
+	// Git plumbing: read-only by construction. `symbolic-ref` is absent because its
+	// two-argument form writes `.git/HEAD`.
+	assert.equal(isSafeCommand("git rev-parse HEAD"), true);
+	assert.equal(isSafeCommand("git blame src/index.ts"), true);
+	assert.equal(isSafeCommand("git ls-tree -r HEAD"), true);
+	assert.equal(isSafeCommand("git cat-file -p HEAD:src/index.ts"), true);
+	assert.equal(isSafeCommand("git for-each-ref"), true);
+	assert.equal(isSafeCommand("git describe --tags"), true);
+	assert.equal(isSafeCommand("git shortlog -sn"), true);
+	assert.equal(isSafeCommand("git rev-list --count HEAD"), true);
+	assert.equal(isSafeCommand("git symbolic-ref HEAD refs/heads/other"), false);
+
+	// Listing forms that share a name with a mutating subcommand.
+	assert.equal(isSafeCommand("git reflog"), true);
+	assert.equal(isSafeCommand("git reflog show main"), true);
+	assert.equal(isSafeCommand("git reflog --date=iso"), true);
+	assert.equal(isSafeCommand("git reflog delete HEAD@{1}"), false);
+	assert.equal(isSafeCommand("git reflog expire --all"), false);
+	assert.equal(isSafeCommand("git stash list"), true);
+	assert.equal(isSafeCommand("git stash"), false);
+	assert.equal(isSafeCommand("git stash push"), false);
+	assert.equal(isSafeCommand("git tag -l"), true);
+	assert.equal(isSafeCommand("git tag --list 'v*'"), true);
+	assert.equal(isSafeCommand("git tag -l -n"), true);
+	assert.equal(isSafeCommand("git tag -d v1"), false);
+	assert.equal(isSafeCommand("git tag -l -d v1"), false);
+	assert.equal(isSafeCommand("git tag -a v1 -m x"), false);
+	assert.equal(isSafeCommand("git worktree list"), true);
+	assert.equal(isSafeCommand("git worktree add ../x"), false);
+	assert.equal(isSafeCommand("git submodule status"), true);
+	assert.equal(isSafeCommand("git submodule update --init"), false);
+
+	// Stdout-only text and checksum tools.
+	assert.equal(isSafeCommand("nl -ba f"), true);
+	assert.equal(isSafeCommand("od -c f"), true);
+	assert.equal(isSafeCommand("cmp a b"), true);
+	assert.equal(isSafeCommand("sha256sum f"), true);
+	assert.equal(isSafeCommand("strings f"), true);
+	assert.equal(isSafeCommand("cut -d: -f1 f"), true);
+	assert.equal(isSafeCommand("readlink -f x"), true);
+	assert.equal(isSafeCommand("realpath ."), true);
+	// The row the task asked for, kept as a refusal with the reason in the source:
+	// a second positional argument is an output file for xxd.
+	assert.equal(isSafeCommand("xxd f"), false);
+
+	// sort is argument-inert but not flag-inert: `-o`/`--output` write a file and
+	// `--compress-program` runs a program.
+	assert.equal(isSafeCommand("sort -k1 f"), true);
+	assert.equal(isSafeCommand("sort -o /tmp/x f"), false);
+	assert.equal(isSafeCommand("sort -o/tmp/x f"), false);
+	assert.equal(isSafeCommand("sort --output=/tmp/x f"), false);
+	assert.equal(isSafeCommand("sort --compress-program=rm f"), false);
+	assert.equal(isSafeCommand("sort -T /tmp f"), false);
+	// A quote may sit between the separator and the flag; sort still reads it as one.
+	assert.equal(isSafeCommand('sort "-o" /tmp/x f'), false);
+	assert.equal(isSafeCommand('sort "--output=/tmp/x" f'), false);
+	assert.equal(isSafeCommand('sort "-T" /tmp f'), false);
+
+	// sed keeps only print scripts: `w`/`W` write a file, `e` runs a command, and
+	// `-e`/`-f` add scripts the grammar cannot see.
+	assert.equal(isSafeCommand("sed -n '1,40p' f"), true);
+	assert.equal(isSafeCommand("sed -n '$p' f"), true);
+	assert.equal(isSafeCommand("sed -n '1p;5p' f"), true);
+	assert.equal(isSafeCommand("sed -n 1,40p f"), true);
+	assert.equal(isSafeCommand("sed -n 'w /tmp/x' f"), false);
+	assert.equal(isSafeCommand("sed -n '1w /tmp/x' f"), false);
+	assert.equal(isSafeCommand("sed -n 's/a/b/w out' f"), false);
+	assert.equal(isSafeCommand("sed -n 's/a/b/e' f"), false);
+	assert.equal(isSafeCommand("sed -n '1e touch /tmp/x' f"), false);
+	assert.equal(isSafeCommand("sed -n -e '1p' f"), false);
+	assert.equal(isSafeCommand("sed -n 'p' --expression='w /tmp/x' f"), false);
+
+	// find's file-writing actions, which are not the `-delete`/`-exec` pair the
+	// earlier guard already refused.
+	assert.equal(isSafeCommand("find src -fprintf /tmp/x '%p'"), false);
+	assert.equal(isSafeCommand("find src -fprint0 /tmp/x"), false);
+	assert.equal(isSafeCommand("find src -fls /tmp/x"), false);
+	assert.equal(isSafeCommand("find . -execdir rm {} +"), false);
+	assert.equal(isSafeCommand("find src -printf '%p'"), true);
+
+	// awk's program is visible to the mutating scan, its `-f` script file is not.
+	assert.equal(isSafeCommand("awk '{print $1}' f"), true);
+	assert.equal(isSafeCommand("awk -f prog.awk f"), false);
+	assert.equal(isSafeCommand('awk "-f" prog.awk f'), false);
+	assert.equal(isSafeCommand("awk '{print > \"out\"}' f"), false);
 });
 
 test("isSafeCommand permits read-only commands and blocks mutating commands", () => {

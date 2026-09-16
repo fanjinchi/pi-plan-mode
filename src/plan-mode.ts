@@ -240,7 +240,10 @@ const MUTATING_BASH_PATTERNS = [
 	/\bbun\s+(add|remove|install|update|publish)\b/i,
 	/\bpip\s+(install|uninstall)\b/i,
 	/\buv\s+(add|remove|sync|lock|pip\s+install)\b/i,
-	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|switch|stash|cherry-pick|revert|tag|init|clone)\b/i,
+	// `stash` and `tag` are missing on purpose: their listing forms are allowlisted
+	// below (`git stash list`, `git tag -l`), and those patterns pin the listing
+	// verb, so the mutating subcommands already fail the allowlist first.
+	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|switch|cherry-pick|revert|init|clone)\b/i,
 	/\b(sudo|su|kill|pkill|killall|reboot|shutdown)\b/i,
 	/\b(?:bash|zsh|fish|ksh|dash|csh|tcsh|pwsh)\b/i,
 	/\bsystem\s*\(/i,
@@ -253,7 +256,23 @@ const SAFE_BASH_PATTERNS = [
 	/^\s*(cat|head|tail|less|more|grep|find|ls|pwd|echo|printf|wc|sort|uniq|diff|file|stat|du|df|tree|which|whereis|type|env|printenv|uname|whoami|id|date|uptime|ps|jq|awk|rg|fd|bat|eza)\b/i,
 	/^\s*sed\s+-n\b/i,
 	/^\s*cd\b/i,
+	// Read-only text and checksum tools: every one of them writes to stdout only.
+	// `xxd` is absent on purpose: its second positional argument is an output file
+	// (`xxd in out`), which a name list cannot rule out — use `od -c` instead.
+	/^\s*(nl|cmp|od|hexdump|readlink|realpath|sha256sum|shasum|md5sum|cksum|strings|basename|dirname|cut|paste|tr|column|expand|fold|join|comm|seq|expr|rev|tac|test)\b/i,
 	/^\s*git\s+(status|log|diff|show|config\s+--get|ls-files|grep)\b/i,
+	// Read-only plumbing: none of these writes a ref or a file, and `--output` (the
+	// one file-writing flag in this family) is refused above for every command.
+	// `git symbolic-ref` is absent because its two-argument form writes `.git/HEAD`.
+	/^\s*git\s+(rev-parse|blame|ls-tree|cat-file|for-each-ref|describe|shortlog|rev-list|show-ref|whatchanged|diff-tree|diff-index|diff-files|check-ignore|check-attr|name-rev|var|count-objects)\b/i,
+	// Listing forms that share a name with a mutating subcommand: the pattern pins
+	// the listing form, so `git stash push`, `git tag -d`, `git reflog expire`,
+	// `git worktree add`, and `git submodule update` never match it.
+	/^\s*git\s+stash\s+list\b/i,
+	/^\s*git\s+reflog(?:\s+(?!delete\b|expire\b|drop\b)\S+)*\s*$/i,
+	/^\s*git\s+tag\s+(?:-l|--list)(?:\s+(?!--?(?:delete|annotate|sign|force|message)\b|-[dasfm]\b)\S+)*\s*$/i,
+	/^\s*git\s+worktree\s+list\b/i,
+	/^\s*git\s+submodule\s+(?:status|summary)\b/i,
 	// `git branch` and `git remote` are read-only in their listing forms only:
 	// `branch -D` deletes a branch, `remote add` rewrites `.git/config`.
 	/^\s*git\s+branch(?:\s+(?:-[avr]+|--all|--remotes|--verbose|--show-current|--list))*\s*$/i,
@@ -263,11 +282,14 @@ const SAFE_BASH_PATTERNS = [
 	/^\s*(node|python|python3|npm|tsc|biome|ruff|ty)\s+--version\b/i,
 ];
 
-// Commands that are read-only by construction: they can neither write files nor
-// execute other programs on their own. For these, search patterns and arguments
-// are inert, so the mutating-keyword list below is skipped entirely — "grep -rn
-// "rm -rf" ." or "grep -rn code docs/" are legitimate searches and must not be
-// blocked just because the searched text resembles a mutating command.
+// Commands whose *arguments* are read-only by construction: a search pattern or a
+// path cannot write a file or execute a program, so the mutating-keyword list
+// below is skipped entirely — "grep -rn "rm -rf" ." or "grep -rn code docs/" are
+// legitimate searches and must not be blocked just because the searched text
+// resembles a mutating command. A flag that does write (`sort -o out`) is refused
+// by the head-specific guards above, which run before this shortcut. `awk` is
+// absent here for the opposite reason: its program is not inert, so it stays on
+// the scanned path.
 const PURE_READ_BASH_COMMANDS: ReadonlySet<string> = new Set([
 	"cat",
 	"head",
@@ -296,6 +318,30 @@ const PURE_READ_BASH_COMMANDS: ReadonlySet<string> = new Set([
 	"fd",
 	"bat",
 	"eza",
+	"nl",
+	"od",
+	"hexdump",
+	"cmp",
+	"readlink",
+	"realpath",
+	"sha256sum",
+	"shasum",
+	"md5sum",
+	"cksum",
+	"strings",
+	"basename",
+	"dirname",
+	"cut",
+	"paste",
+	"tr",
+	"column",
+	"expand",
+	"fold",
+	"join",
+	"comm",
+	"seq",
+	"rev",
+	"tac",
 ]);
 
 export default function planMode(pi: ExtensionAPI) {
@@ -1347,8 +1393,14 @@ export function isSafeCommand(command: string) {
 	if (/(^|[^<])>(?!>)|>>|<<|<\s*\(/.test(noFdRedirs)) return false;
 
 	// `git log --output=x` writes x (same for `git diff`/`git show`), and no
-	// read-only command in the allowlist takes an output-file flag.
-	if (/(?:^|\s)--output(?:=|\s|$)/i.test(unquoted)) return false;
+	// read-only command in the allowlist takes an output-file flag. Unlike the
+	// redirect check above, this one runs on the raw command text, and a quote may sit
+	// between the separator and the dashes: quoting a flag does not stop the command
+	// from consuming it (`git log "--output=/tmp/x" f` reaches git as
+	// `--output=/tmp/x`). The price is a quoted literal that merely spells
+	// `--output=`, such as a `grep -rn "--output=" .` search; drop the `=` to search
+	// for the same text.
+	if (/(?:^|[\s'"])--output(?:=|\s|['"]|$)/i.test(singleLine)) return false;
 
 	// Every pipeline stage / ; / && / || branch must independently pass the
 	// allowlist. This stops "grep foo | xargs rm", "echo hi | bash",
@@ -1366,27 +1418,79 @@ export function isSafeCommand(command: string) {
 		if (!SAFE_BASH_PATTERNS.some((pattern) => pattern.test(segment))) return false;
 
 		const head = firstCommandWord(segment);
-		if (!head || PURE_READ_BASH_COMMANDS.has(head)) continue;
+		if (!head) continue;
 
-		// find can mutate via -delete/-exec/-ok; other flags are read-only, so a
-		// search for a file named "rm" must not trip the keyword list.
+		// Head-specific guards run before the inert-argument shortcut below, because a
+		// command that is read-only by construction can still carry a flag that writes
+		// (`sort -o out`).
+		//
+		// find can mutate via -delete/-exec/-ok (and their -execdir/-okdir forms) and
+		// writes a file through -fprint/-fprint0/-fprintf/-fls; other flags are
+		// read-only, so a search for a file named "rm" must not trip the keyword list.
 		if (head === "find") {
-			if (/\s-(?:delete|exec|ok)\b/i.test(segment)) return false;
+			if (/\s-(?:delete|exec|execdir|ok|okdir|fprintf|fprint0?|fls)\b/i.test(segment)) return false;
 			continue;
 		}
 
 		// sed edits in place with `-i` (in any combination, including `-ni` and
-		// `-i.bak`), and `-f`/`--file` runs a script file whose commands this
-		// allowlist cannot see; `sed -n -i 's/a/Z/' f` empties a file. Quoted text is
-		// dropped first, because a `-i` inside a script or pattern is not a flag.
+		// `-i.bak`), `-f`/`--file` runs a script file whose commands this allowlist
+		// cannot see, and `-e`/`--expression` adds a second script that only the first
+		// one would be checked against; `sed -n -i 's/a/Z/' f` empties a file. Quoted
+		// text is dropped first, because a `-i` inside a script or pattern is not a
+		// flag.
 		if (head === "sed") {
 			const sedFlags = segment.replace(/"[^"]*"|'[^']*'/g, " ");
-			if (/(?:^|\s)(?:--in-place\b|--file\b|-f\b|-[a-zA-Z.]*i[a-zA-Z.]*)/i.test(sedFlags))
+			if (
+				/(?:^|\s)(?:--in-place\b|--file\b|-f\b|-e\b|--expression\b|-[a-zA-Z.]*i[a-zA-Z.]*)/i.test(
+					sedFlags,
+				)
+			)
+				return false;
+			// The flags are not the whole hazard: a script can write files (the `w`/`W`
+			// command, `s///w file`) and run commands (GNU's `e` command, `s///e`), and
+			// that is exactly the text the flag check above drops. Telling a read-only
+			// script from a writing one needs a full sed grammar, so the script argument
+			// is allowlisted instead: numeric or `$` addresses followed by `p`,
+			// `;`-joined. Everything else is refused — including substitution and regex
+			// addresses, so `sed -n '/x/p' f` needs `grep` instead. That loss is the price
+			// of keeping this entry sound.
+			const sedScript = (
+				segment.match(/^\s*sed\s+-n(?:\s+(?:--|-[a-zA-Z.]+))*\s+(\S+)/i)?.[1] ?? ""
+			).replace(/^(['"])([\s\S]*)\1$/, "$2");
+			if (!/^(?:\d+|\$)?(?:,(?:\d+|\$)?)?p(?:;(?:\d+|\$)?(?:,(?:\d+|\$)?)?p)*$/.test(sedScript))
 				return false;
 		}
-		// Non-pure-read heads (echo, printf, awk, sed, git, npm, env, ...) are
-		// checked against the mutating keywords on the full segment text (quotes
-		// intact) — e.g. awk '{system("rm -rf /")}' stays blocked.
+
+		// sort is argument-inert but not flag-inert: `-o FILE` and `--output=FILE`
+		// write a file, and `--compress-program` runs a program. The redirect check
+		// above cannot see a handle a command opens itself. Quoted text is deliberately
+		// not stripped here, and the left boundary accepts a quote: `sort "-o" out f`
+		// reaches sort as `-o out`.
+		if (head === "sort") {
+			if (
+				/(?:^|[\s'"])(?:-o\S*|--output(?:=|\s|['"]|$)|--compress-program(?:=|\s|['"]|$)|-T\S*|--temporary-directory(?:=|\s|['"]|$))/i.test(
+					segment,
+				)
+			)
+				return false;
+		}
+
+		// awk runs a program that can write files and execute commands. One passed on
+		// the command line stays visible to the mutating-keyword scan below
+		// (`awk '{system("rm -rf /")}'`, `awk '{print > "out"}'`), but `-f prog.awk`
+		// hides it in a file — the indirection the sed flag guard refuses above. The
+		// check runs on the raw segment and lets a quote sit in front of the dash,
+		// because `awk "-f" prog.awk` reaches awk as `-f prog.awk`; the price is that a
+		// quoted literal (`awk '{print "-f"}'`) is refused as well.
+		if (head === "awk") {
+			if (/(?:^|[\s'"])-{1,2}(?:f|file)(?=\s|=|['"]|$)/.test(segment)) return false;
+		}
+
+		if (PURE_READ_BASH_COMMANDS.has(head)) continue;
+
+		// Non-pure-read heads (echo, printf, awk, git, npm, env, ...) are checked
+		// against the mutating keywords on the full segment text (quotes intact) —
+		// e.g. awk '{system("rm -rf /")}' stays blocked.
 		const segmentNoFdRedirs = segment.replace(/\b[012]>&[012]\b/g, "");
 		if (MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(segmentNoFdRedirs))) return false;
 	}
