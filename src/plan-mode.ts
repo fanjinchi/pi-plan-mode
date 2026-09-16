@@ -416,10 +416,12 @@ export default function planMode(pi: ExtensionAPI) {
 		if (!SHELL_TOOL_NAMES.has(event.toolName)) return;
 
 		const command = readCommand(event.input);
-		if (!isSafeCommand(command)) {
+		const shellCommandAllowed =
+			event.toolName === "powershell" ? isSafePowerShellCommand(command) : isSafeCommand(command);
+		if (!shellCommandAllowed) {
 			return {
 				block: true,
-				reason: `Plan mode blocks mutating or non-allowlisted bash commands.\nCommand: ${command}`,
+				reason: `Plan mode blocks mutating or non-allowlisted ${event.toolName} commands.\nCommand: ${command}`,
 			};
 		}
 	});
@@ -1360,6 +1362,157 @@ export function isSafeCommand(command: string) {
 		if (MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(segmentNoFdRedirs))) return false;
 	}
 	return true;
+}
+
+// PowerShell needs its own dialect. The POSIX allowlist matches whole command
+// words (`rg`, `git status`), while a PowerShell command is a Verb-Noun cmdlet
+// with aliases, script blocks, and its own expansion syntax: judging it by the
+// POSIX list would refuse nearly every native PowerShell form. Like the POSIX
+// one, this dialect is default-deny and checks every pipeline stage on its own.
+const ALLOWED_POWERSHELL_HEADS: ReadonlySet<string> = new Set([
+	// Read-only cmdlets whose verb is not Get-* (Get-* has its own rule below).
+	"test-path",
+	"resolve-path",
+	"split-path",
+	"join-path",
+	"convert-path",
+	"measure-object",
+	"compare-object",
+	"sort-object",
+	"select-object",
+	"where-object",
+	"group-object",
+	"join-string",
+	"out-string",
+	"format-table",
+	"format-list",
+	"format-wide",
+	"format-custom",
+	"select-string",
+	"convertto-json",
+	"convertfrom-json",
+	// Read-only aliases of the cmdlets above and of Get-*.
+	"ls",
+	"dir",
+	"gci",
+	"cat",
+	"type",
+	"gc",
+	"sls",
+	"gv",
+	"gm",
+	"ft",
+	"fl",
+	"fw",
+	"sort",
+	"measure",
+	"compare",
+	"group",
+	"where",
+	"select",
+]);
+
+// Verbs that mutate state or run code. PowerShell owns Verb-Noun names, so the
+// verb alone identifies the intent even when the cmdlet is not installed.
+const POWERSHELL_MUTATING_HEAD_PATTERN =
+	/^(?:set|add|clear|remove|move|copy|rename|new|out|export|import|invoke|start|stop|restart|install|uninstall|update|enable|disable|register|unregister|save|publish|send|enter|exit|push|pop|resume|suspend|submit|debug|write)-/;
+
+// Nouns that write, whatever the verb in front of them: this catches module
+// cmdlets that mutate a file under a verb the list above does not name.
+const POWERSHELL_WRITING_NOUN_PATTERN = /-(?:item|content)$/;
+
+// Aliases of the mutating cmdlets. Default-deny already refuses them; naming
+// them keeps the refusal explicit and independent of the allowlist above.
+const POWERSHELL_MUTATING_ALIASES: ReadonlySet<string> = new Set([
+	"rm",
+	"del",
+	"erase",
+	"rd",
+	"rmdir",
+	"ri",
+	"mv",
+	"move",
+	"mi",
+	"rni",
+	"copy",
+	"cp",
+	"cpi",
+	"ni",
+	"si",
+	"sc",
+	"sa",
+	"ac",
+	"clc",
+	"clear",
+	"curl",
+	"wget",
+	"iex",
+]);
+
+// Get-* is read-only in itself, apart from cmdlets that block on interactive
+// input or hand out stored secrets.
+const POWERSHELL_DENIED_GET_HEADS: ReadonlySet<string> = new Set([
+	"get-credential",
+	"get-secret",
+	"get-secretinfo",
+	"get-secretvault",
+]);
+
+export function isSafePowerShellCommand(command: string): boolean {
+	const trimmed = command.trim();
+	if (!trimmed) return false;
+
+	// Newlines separate statements exactly like `;`, so normalize them first and
+	// then let every statement stand on its own.
+	const singleLine = trimmed.replace(/\n+/g, "; ");
+
+	// Here-strings (@' ... '@ / @" ... "@) and stop-parsing (--%) are matched
+	// before quotes are stripped, because the opening token carries the hazard.
+	if (/@['"]/.test(singleLine) || /--%/.test(singleLine)) return false;
+
+	// Single quotes are literal in PowerShell, double quotes are not: `$x` and
+	// `$(...)` expand inside them, so only single-quoted text may be dropped.
+	const withoutSingleQuotes = singleLine.replace(/'[^']*'/g, " ");
+
+	// Variables, subexpressions, script blocks, argument splatting (@), the call
+	// operator (&) and backtick escapes all inject or execute code, and a
+	// read-only command never needs them.
+	if (/[$`@{}()&]/.test(withoutSingleQuotes)) return false;
+
+	// Redirects write files in PowerShell too (> , >> , *> , 2>).
+	if (/[<>]/.test(withoutSingleQuotes)) return false;
+
+	// A parameter is never quoted in PowerShell, so both quote styles can be
+	// dropped here: that keeps a quoted search pattern such as "-Command" from
+	// being misread. `-EncodedCommand` and `-Command` hand a script to a host
+	// that the allowlist refuses anyway; the rule keeps the refusal explicit.
+	const withoutQuotes = singleLine.replace(/"[^"]*"|'[^']*'/g, " ");
+	if (/-encodedcommand\b|-command\b/i.test(withoutQuotes)) return false;
+
+	const segments = splitShellSegments(singleLine);
+	if (segments.length === 0) return false;
+
+	for (const segment of segments) {
+		// `. .\script.ps1` runs a script in the current scope; refused outright.
+		if (/^\s*\./.test(segment)) return false;
+		const head = firstCommandWord(segment);
+		if (!head || !isAllowedPowerShellHead(head, segment)) return false;
+	}
+	return true;
+}
+
+function isAllowedPowerShellHead(head: string, segment: string): boolean {
+	if (POWERSHELL_MUTATING_ALIASES.has(head)) return false;
+	if (ALLOWED_POWERSHELL_HEADS.has(head)) return true;
+	if (POWERSHELL_MUTATING_HEAD_PATTERN.test(head)) return false;
+	// Get-* is read-only apart from the cmdlets refused above. This rule runs
+	// before the noun rule on purpose: `Get-Content` and `Get-Item` are read-only
+	// yet carry a writing noun.
+	if (head.startsWith("get-")) return !POWERSHELL_DENIED_GET_HEADS.has(head);
+	if (POWERSHELL_WRITING_NOUN_PATTERN.test(head)) return false;
+	// PowerShell runs native executables as well, so a stage the POSIX dialect
+	// already accepts (`git status --short`, `grep -rn x .`) stays accepted here.
+	return isSafeCommand(segment);
 }
 
 // Splits a command on unquoted separators (|, ;, &&, ||), so quoted search

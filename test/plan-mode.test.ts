@@ -10,6 +10,7 @@ import planMode, {
 	isDefaultPlanModeTool,
 	isPlanFileTarget,
 	isSafeCommand,
+	isSafePowerShellCommand,
 	normalizePlanModeQuestionParams,
 	PLAN_EMBED_MAX_CHARS,
 	readPlanFile,
@@ -334,6 +335,90 @@ test("tool_call gating also applies to extension tools that take over edit/write
 			"a read-only command stays allowed through a shadowed powershell",
 		);
 	}
+});
+
+test("powershell gating uses the PowerShell allowlist dialect", async (t) => {
+	// The POSIX allowlist matches whole command words, so a cmdlet fails every
+	// stage while a native form that happens to parse as a POSIX head passes.
+	// The powershell tool is judged by its own dialect instead, and that dialect
+	// still accepts the POSIX forms because PowerShell runs them too.
+	const mock = createMockPi({
+		activeTools: ["read", "powershell"],
+		allTools: [extensionTool("read"), extensionTool("powershell")],
+	});
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+	const { ctx } = createMockContext({
+		cwd: tmpDir,
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	const toolCallHandlers = mock.events.get("tool_call") ?? [];
+	for (const handler of toolCallHandlers) {
+		const run = async (command: string) => {
+			const result = await handler({ toolName: "powershell", input: { command } }, ctx);
+			return result as { block?: boolean } | undefined;
+		};
+
+		for (const command of [
+			"Get-ChildItem -Recurse",
+			"Get-Content pi_plan.md",
+			"Get-Content pi_plan.md | Select-String -Pattern status",
+			"Test-Path pi_plan.md",
+			"git status --short",
+			"cat pi_plan.md",
+			"ls",
+		]) {
+			assert.equal((await run(command))?.block, undefined, `powershell must allow: ${command}`);
+		}
+
+		for (const command of [
+			"Set-Content -Path pi_plan.md -Value x",
+			"Out-File out.txt",
+			"Remove-Item -Recurse -Force build",
+			"New-Item -ItemType Directory build",
+			"Copy-Item a.txt b.txt",
+			"Invoke-Expression 'Remove-Item x'",
+			"Frobnicate-Thing x",
+			"rm -rf build",
+			"Get-ChildItem; Remove-Item x",
+			"Get-ChildItem $(Get-Location)",
+			"Get-Content `$HOME",
+			"@'\nRemove-Item x\n'@",
+			"Get-ChildItem > out.txt",
+			"Get-Content -EncodedCommand VABlAHMAdAA=",
+			"Get-Content --% pi_plan.md",
+			"Where-Object { Remove-Item x }",
+			"& .\\script.ps1",
+			". .\\script.ps1",
+		]) {
+			assert.equal((await run(command))?.block, true, `powershell must block: ${command}`);
+		}
+	}
+});
+
+test("isSafePowerShellCommand keeps the POSIX union and refuses PowerShell mutation", () => {
+	assert.equal(isSafePowerShellCommand("Get-ChildItem -Recurse"), true);
+	assert.equal(isSafePowerShellCommand("git status --short"), true);
+	assert.equal(isSafePowerShellCommand("cat pi_plan.md"), true);
+	// The dialect difference: a cmdlet is not a POSIX command word.
+	assert.equal(isSafeCommand("Get-ChildItem -Recurse"), false);
+	assert.equal(isSafePowerShellCommand("Set-Content -Path x -Value y"), false);
+	assert.equal(isSafePowerShellCommand("Get-Credential"), false);
+	assert.equal(isSafePowerShellCommand(""), false);
 });
 
 test("isSafeCommand permits read-only commands and blocks mutating commands", () => {
