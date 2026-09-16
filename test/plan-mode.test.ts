@@ -367,6 +367,7 @@ test("powershell gating uses the PowerShell allowlist dialect", async (t) => {
 	for (const handler of sessionStartHandlers) await handler({}, ctx);
 
 	const toolCallHandlers = mock.events.get("tool_call") ?? [];
+	assert.ok(toolCallHandlers.length > 0, "the shell gate must be registered on tool_call");
 	for (const handler of toolCallHandlers) {
 		const run = async (command: string) => {
 			const result = await handler({ toolName: "powershell", input: { command } }, ctx);
@@ -381,6 +382,15 @@ test("powershell gating uses the PowerShell allowlist dialect", async (t) => {
 			"git status --short",
 			"cat pi_plan.md",
 			"ls",
+			// The parameter rule is anchored to argument position, so read-only
+			// commands that merely mention the token stay allowed.
+			"Get-Command Get-Content",
+			"cat my-command.txt",
+			"Get-ChildItem -Filter *-command*",
+			// A line break at the very end is trailing whitespace: `trim()` removes it
+			// before the dialect runs (the POSIX dialect does the same), and a statement
+			// that ends the command cannot hide a second one behind it.
+			"Get-ChildItem -Recurse\r",
 		]) {
 			assert.equal((await run(command))?.block, undefined, `powershell must allow: ${command}`);
 		}
@@ -395,10 +405,22 @@ test("powershell gating uses the PowerShell allowlist dialect", async (t) => {
 			"Frobnicate-Thing x",
 			"rm -rf build",
 			"Get-ChildItem; Remove-Item x",
+			"Get-ChildItem | Remove-Item x",
+			"Get-ChildItem || Remove-Item x",
+			"Get-ChildItem & Remove-Item x",
 			"Get-ChildItem $(Get-Location)",
 			"Get-Content `$HOME",
 			"@'\nRemove-Item x\n'@",
+			// PowerShell's tokenizer treats CR, CRLF, and LF alike as statement
+			// separators, so a bare CR must not hide a second statement.
+			"Get-ChildItem\rRemove-Item -Recurse -Force build",
+			"Get-ChildItem\r\nRemove-Item x",
+			"Get-ChildItem\nRemove-Item x",
+			// A vertical tab is whitespace to the parser, not a command boundary.
+			"Get-ChildItem\u000bRemove-Item x",
 			"Get-ChildItem > out.txt",
+			// Pins the argument-position parameter rule: the realistic form,
+			// `powershell -EncodedCommand ...`, is refused by head already.
 			"Get-Content -EncodedCommand VABlAHMAdAA=",
 			"Get-Content --% pi_plan.md",
 			"Where-Object { Remove-Item x }",

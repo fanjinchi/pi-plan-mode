@@ -415,6 +415,11 @@ export default function planMode(pi: ExtensionAPI) {
 		// still pass the command allowlist.
 		if (!SHELL_TOOL_NAMES.has(event.toolName)) return;
 
+		// The dialect seam is the tool *name*: `powershell` gets the PowerShell
+		// dialect and every other shell name the POSIX one. That is a convention, not
+		// metadata Pi publishes, so a new shell tool name has to be classified here
+		// deliberately. An unclassified shell falls back to the POSIX rules, which is
+		// the fail-closed direction.
 		const command = readCommand(event.input);
 		const shellCommandAllowed =
 			event.toolName === "powershell" ? isSafePowerShellCommand(command) : isSafeCommand(command);
@@ -1462,9 +1467,24 @@ export function isSafePowerShellCommand(command: string): boolean {
 	const trimmed = command.trim();
 	if (!trimmed) return false;
 
-	// Newlines separate statements exactly like `;`, so normalize them first and
-	// then let every statement stand on its own.
-	const singleLine = trimmed.replace(/\n+/g, "; ");
+	// PowerShell's tokenizer treats CR and LF as the same statement separator: it
+	// normalizes CRLF, and a bare CR is a newline of its own. Every line-break form
+	// therefore has to become a separator here, or a bare CR would hide a second
+	// statement behind an allowlisted head (`Get-ChildItem\rRemove-Item x`).
+	const singleLine = trimmed.replace(/\r\n?|\n/g, "; ");
+
+	// A stray control character is refused: a read-only command needs none of them,
+	// and the parser treats some (a vertical tab, for instance) as whitespace. LF
+	// and CR are allowed through here only because the normalization above already
+	// replaced every line-break form with `; `; this rule is the backstop for the
+	// rest of the C0 range. (No regex: biome's noControlCharactersInRegex rule
+	// rejects the character class, and the codepoints are clearer spelled out.)
+	const hasStrayControlCharacter = [...singleLine].some((character) => {
+		const code = character.codePointAt(0) ?? 0;
+		if (code === 0x09 || code === 0x0a || code === 0x0d) return false;
+		return code < 0x20 || code === 0x7f || code === 0x85 || code === 0x2028 || code === 0x2029;
+	});
+	if (hasStrayControlCharacter) return false;
 
 	// Here-strings (@' ... '@ / @" ... "@) and stop-parsing (--%) are matched
 	// before quotes are stripped, because the opening token carries the hazard.
@@ -1476,7 +1496,9 @@ export function isSafePowerShellCommand(command: string): boolean {
 
 	// Variables, subexpressions, script blocks, argument splatting (@), the call
 	// operator (&) and backtick escapes all inject or execute code, and a
-	// read-only command never needs them.
+	// read-only command never needs them. Refusing `&` outright is also why the
+	// `&&` case in `splitShellSegments` is unreachable from this dialect (the POSIX
+	// dialect still needs it).
 	if (/[$`@{}()&]/.test(withoutSingleQuotes)) return false;
 
 	// Redirects write files in PowerShell too (> , >> , *> , 2>).
@@ -1484,17 +1506,20 @@ export function isSafePowerShellCommand(command: string): boolean {
 
 	// A parameter is never quoted in PowerShell, so both quote styles can be
 	// dropped here: that keeps a quoted search pattern such as "-Command" from
-	// being misread. `-EncodedCommand` and `-Command` hand a script to a host
-	// that the allowlist refuses anyway; the rule keeps the refusal explicit.
+	// being misread. The rule is anchored to argument position so a read-only
+	// command that merely mentions the token (`Get-Command Get-Content`,
+	// `cat my-command.txt`) still passes. `-EncodedCommand` and `-Command` hand a
+	// script to a host that this allowlist refuses anyway; the rule keeps the
+	// refusal explicit in one place instead of relying on the head list.
 	const withoutQuotes = singleLine.replace(/"[^"]*"|'[^']*'/g, " ");
-	if (/-encodedcommand\b|-command\b/i.test(withoutQuotes)) return false;
+	if (/(?:^|\s)-(?:encodedcommand|command)\b/i.test(withoutQuotes)) return false;
 
 	const segments = splitShellSegments(singleLine);
 	if (segments.length === 0) return false;
 
 	for (const segment of segments) {
-		// `. .\script.ps1` runs a script in the current scope; refused outright.
-		if (/^\s*\./.test(segment)) return false;
+		// No separate dot-source check is needed: `firstCommandWord` requires a
+		// letter or underscore first, so `. .\script.ps1` has no head and is refused.
 		const head = firstCommandWord(segment);
 		if (!head || !isAllowedPowerShellHead(head, segment)) return false;
 	}
