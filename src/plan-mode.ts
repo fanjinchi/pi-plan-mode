@@ -253,7 +253,12 @@ const SAFE_BASH_PATTERNS = [
 	/^\s*(cat|head|tail|less|more|grep|find|ls|pwd|echo|printf|wc|sort|uniq|diff|file|stat|du|df|tree|which|whereis|type|env|printenv|uname|whoami|id|date|uptime|ps|jq|awk|rg|fd|bat|eza)\b/i,
 	/^\s*sed\s+-n\b/i,
 	/^\s*cd\b/i,
-	/^\s*git\s+(status|log|diff|show|branch|remote|config\s+--get|ls-files|grep)\b/i,
+	/^\s*git\s+(status|log|diff|show|config\s+--get|ls-files|grep)\b/i,
+	// `git branch` and `git remote` are read-only in their listing forms only:
+	// `branch -D` deletes a branch, `remote add` rewrites `.git/config`.
+	/^\s*git\s+branch(?:\s+(?:-[avr]+|--all|--remotes|--verbose|--show-current|--list))*\s*$/i,
+	/^\s*git\s+remote(?:\s+(?:-v|--verbose))?\s*$/i,
+	/^\s*git\s+remote\s+(?:show|get-url)\b/i,
 	/^\s*npm\s+(list|ls|view|info|search|outdated|audit)\b/i,
 	/^\s*(node|python|python3|npm|tsc|biome|ruff|ty)\s+--version\b/i,
 ];
@@ -418,8 +423,8 @@ export default function planMode(pi: ExtensionAPI) {
 		// The dialect seam is the tool *name*: `powershell` gets the PowerShell
 		// dialect and every other shell name the POSIX one. That is a convention, not
 		// metadata Pi publishes, so a new shell tool name has to be classified here
-		// deliberately. An unclassified shell falls back to the POSIX rules, which is
-		// the fail-closed direction.
+		// deliberately. An unclassified shell falls back to the POSIX rules, which
+		// refuse anything that is not read-shaped.
 		const command = readCommand(event.input);
 		const shellCommandAllowed =
 			event.toolName === "powershell" ? isSafePowerShellCommand(command) : isSafeCommand(command);
@@ -1341,6 +1346,10 @@ export function isSafeCommand(command: string) {
 	const noFdRedirs = unquoted.replace(/\b[012]>&[012]\b/g, "");
 	if (/(^|[^<])>(?!>)|>>|<<|<\s*\(/.test(noFdRedirs)) return false;
 
+	// `git log --output=x` writes x (same for `git diff`/`git show`), and no
+	// read-only command in the allowlist takes an output-file flag.
+	if (/(?:^|\s)--output(?:=|\s|$)/i.test(unquoted)) return false;
+
 	// Every pipeline stage / ; / && / || branch must independently pass the
 	// allowlist. This stops "grep foo | xargs rm", "echo hi | bash",
 	// "cd / && rm -rf /" and friends from hiding behind a read-only first word.
@@ -1348,6 +1357,12 @@ export function isSafeCommand(command: string) {
 	if (segments.length === 0) return false;
 
 	for (const segment of segments) {
+		// A first token with a path separator is a path, not a command word. The
+		// patterns below are prefix-anchored, so without this guard a path whose
+		// leading word is allowlisted (`cat/../../bin/rm -rf x`) would be waved
+		// through, and Windows accepts `/` as a separator. Path *arguments* such as
+		// `cat ./Makefile` are unaffected: only the first token is inspected.
+		if (hasPathShapedHead(segment)) return false;
 		if (!SAFE_BASH_PATTERNS.some((pattern) => pattern.test(segment))) return false;
 
 		const head = firstCommandWord(segment);
@@ -1360,6 +1375,15 @@ export function isSafeCommand(command: string) {
 			continue;
 		}
 
+		// sed edits in place with `-i` (in any combination, including `-ni` and
+		// `-i.bak`), and `-f`/`--file` runs a script file whose commands this
+		// allowlist cannot see; `sed -n -i 's/a/Z/' f` empties a file. Quoted text is
+		// dropped first, because a `-i` inside a script or pattern is not a flag.
+		if (head === "sed") {
+			const sedFlags = segment.replace(/"[^"]*"|'[^']*'/g, " ");
+			if (/(?:^|\s)(?:--in-place\b|--file\b|-f\b|-[a-zA-Z.]*i[a-zA-Z.]*)/i.test(sedFlags))
+				return false;
+		}
 		// Non-pure-read heads (echo, printf, awk, sed, git, npm, env, ...) are
 		// checked against the mutating keywords on the full segment text (quotes
 		// intact) — e.g. awk '{system("rm -rf /")}' stays blocked.
@@ -1426,8 +1450,12 @@ const POWERSHELL_MUTATING_HEAD_PATTERN =
 // cmdlets that mutate a file under a verb the list above does not name.
 const POWERSHELL_WRITING_NOUN_PATTERN = /-(?:item|content)$/;
 
-// Aliases of the mutating cmdlets. Default-deny already refuses them; naming
-// them keeps the refusal explicit and independent of the allowlist above.
+// Aliases of the mutating cmdlets. Default-deny already refuses every one of
+// them (none is reachable through the POSIX fallback), so this list is redundant
+// by construction: emptying it changes no test outcome, which is why it is
+// defence in depth rather than the gate that stops them. It stays so the refusal
+// is explicit and independent of the allowlist above; the *read* alias entries in
+// ALLOWED_POWERSHELL_HEADS are the part that is load-bearing.
 const POWERSHELL_MUTATING_ALIASES: ReadonlySet<string> = new Set([
 	"rm",
 	"del",
@@ -1474,13 +1502,18 @@ export function isSafePowerShellCommand(command: string): boolean {
 	const singleLine = trimmed.replace(/\r\n?|\n/g, "; ");
 
 	// A stray control character is refused: a read-only command needs none of them,
-	// and the parser treats some (a vertical tab, for instance) as whitespace. LF
-	// and CR are allowed through here only because the normalization above already
-	// replaced every line-break form with `; `; this rule is the backstop for the
-	// rest of the C0 range. (No regex: biome's noControlCharactersInRegex rule
-	// rejects the character class, and the codepoints are clearer spelled out.)
+	// and the parser treats some (a vertical tab, for instance) as whitespace. The
+	// loop mirrors the line-break set the normalization above rewrites -- CR, LF,
+	// NEL (U+0085), LS (U+2028), PS (U+2029) -- and exempts tab, which separates
+	// tokens rather than statements. Keep the members spelled out instead of a
+	// "code < 0x20" test: the three non-ASCII ones are what such a simplification
+	// would silently drop. (No regex: biome's noControlCharactersInRegex rejects a
+	// control-character class.)
 	const hasStrayControlCharacter = [...singleLine].some((character) => {
 		const code = character.codePointAt(0) ?? 0;
+		// Tab separates tokens. CR and LF are exempt only because the normalization
+		// above already rewrote every line-break form, so these two arms are
+		// unreachable by construction; they stay so the loop covers the whole set.
 		if (code === 0x09 || code === 0x0a || code === 0x0d) return false;
 		return code < 0x20 || code === 0x7f || code === 0x85 || code === 0x2028 || code === 0x2029;
 	});
@@ -1514,10 +1547,27 @@ export function isSafePowerShellCommand(command: string): boolean {
 	const withoutQuotes = singleLine.replace(/"[^"]*"|'[^']*'/g, " ");
 	if (/(?:^|\s)-(?:encodedcommand|command)\b/i.test(withoutQuotes)) return false;
 
+	// Acting parameters turn a `Get-*` discovery cmdlet into a mutating or
+	// host-acting one: `Get-Help about_Profiles -Online` opens the default browser,
+	// a third-party `Get-WindowsUpdate -Install` persists changes despite the verb,
+	// `Get-CimInstance -MethodName` invokes a method. The set is curated, not a
+	// proof of read-only -- the `get-` prefix is a naming convention -- so it is a
+	// second gate beside the head list, anchored to argument position like the rule
+	// above.
+	if (
+		/(?:^|\s)-(?:online|install|methodname|acceptall|autoreboot|download)\b/i.test(withoutQuotes)
+	) {
+		return false;
+	}
+
 	const segments = splitShellSegments(singleLine);
 	if (segments.length === 0) return false;
 
 	for (const segment of segments) {
+		// Same path guard as the POSIX judge: `Get-ChildItem/../../bin/x` is a path,
+		// not a cmdlet, and the head rules below would otherwise read its leading
+		// word as an allowlisted cmdlet name.
+		if (hasPathShapedHead(segment)) return false;
 		// No separate dot-source check is needed: `firstCommandWord` requires a
 		// letter or underscore first, so `. .\script.ps1` has no head and is refused.
 		const head = firstCommandWord(segment);
@@ -1573,6 +1623,14 @@ function splitShellSegments(command: string): string[] {
 	}
 	segments.push(current);
 	return segments;
+}
+
+// True when the segment's first token carries a path separator. Such a token is
+// a file to execute rather than a command word, and it is exactly the shape that
+// slips past prefix-anchored patterns (`cat/../../bin/rm -rf x`).
+function hasPathShapedHead(segment: string): boolean {
+	const match = /^\s*(\S+)/.exec(segment);
+	return match ? /[/\\]/.test(match[1]) : false;
 }
 
 function firstCommandWord(segment: string): string | undefined {

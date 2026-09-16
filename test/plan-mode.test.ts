@@ -387,10 +387,25 @@ test("powershell gating uses the PowerShell allowlist dialect", async (t) => {
 			"Get-Command Get-Content",
 			"cat my-command.txt",
 			"Get-ChildItem -Filter *-command*",
+			// A quoted token is a value, not a parameter, so the argument-position rules
+			// ignore it by design.
+			'Get-ChildItem "-Command" dir',
+			// The acting-parameter rule is anchored too: an ordinary parameter of a
+			// read-only cmdlet stays allowed.
+			"Get-Help Get-Content",
+			"Get-CimInstance -ClassName Win32_OperatingSystem",
+			// These read aliases exist only in the PowerShell allowlist (the POSIX
+			// fallback does not know them), so the rows pin those entries.
+			"sls -Pattern status pi_plan.md",
+			"gci -Recurse",
+			// A tab separates tokens rather than statements and stays exempt.
+			"Get-ChildItem\t-Path x",
 			// A line break at the very end is trailing whitespace: `trim()` removes it
 			// before the dialect runs (the POSIX dialect does the same), and a statement
-			// that ends the command cannot hide a second one behind it.
+			// that ends the command cannot hide a second one behind it. The rows go
+			// through the handler, so the trim -> dispatch path is what they assert.
 			"Get-ChildItem -Recurse\r",
+			"Get-ChildItem -Recurse\n",
 		]) {
 			assert.equal((await run(command))?.block, undefined, `powershell must allow: ${command}`);
 		}
@@ -426,8 +441,129 @@ test("powershell gating uses the PowerShell allowlist dialect", async (t) => {
 			"Where-Object { Remove-Item x }",
 			"& .\\script.ps1",
 			". .\\script.ps1",
+			// The `*-Item`/`*-Content` rule is load-bearing: without it both of these
+			// reach the POSIX fallback and are waved through as `tree` and `type`.
+			"tree-item x",
+			"type-content x",
+			// Mutating aliases resolve to a writing cmdlet.
+			"ni x",
+			"sc x",
+			"iex 'x'",
+			"curl http://x",
+			// Acting parameters turn a discovery cmdlet into a mutating or host-acting
+			// one. `-Command:x` binds the parameter (a colon is a valid separator), so
+			// unlike the quoted form above it stays refused rather than being an
+			// oversight: the two look identical to a reader, but only one re-enters the
+			// host parser.
+			"Get-Help about_Profiles -Online",
+			"Get-WindowsUpdate -Install",
+			"Get-CimInstance -ClassName Win32_OperatingSystem -MethodName Reboot",
+			"Get-Content -Command:x y",
+			// The other members of the line-break set the control rule mirrors: NEL and
+			// LS are whitespace to the parser, so no head rule may read past them.
+			"Get-ChildItem\u0085Remove-Item x",
+			"Get-ChildItem\u2028Remove-Item x",
+			// A path-shaped head is a path in this dialect too, and the tightened shared
+			// rules are inherited by the PowerShell union.
+			"Get-ChildItem/../../bin/rm -rf x",
+			"git branch -D main",
+			"git remote add origin http://x",
+			"git log --output=/tmp/x.txt",
+			"sed -n -i 's/a/Z/' f",
 		]) {
 			assert.equal((await run(command))?.block, true, `powershell must block: ${command}`);
+		}
+	}
+});
+
+test("the shared command judge refuses path-shaped heads and mutating git/sed forms", async (t) => {
+	// One table for both shell names: the tightened rules live in the shared judge,
+	// so `bash` and `powershell` must agree. Every row goes through the real
+	// tool_call handler (trim -> dispatch -> dialect), for the same reason.
+	const mock = createMockPi({
+		activeTools: ["read", "bash", "powershell"],
+		allTools: [extensionTool("read"), extensionTool("bash"), extensionTool("powershell")],
+	});
+	planMode(mock.pi);
+
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "plan-test-"));
+	t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+	const { ctx } = createMockContext({
+		cwd: tmpDir,
+		sessionManager: {
+			getEntries: () => [
+				{
+					type: "custom",
+					customType: "plan-mode-state",
+					data: { enabled: true },
+				},
+			],
+		},
+	});
+
+	const sessionStartHandlers = mock.events.get("session_start") ?? [];
+	for (const handler of sessionStartHandlers) await handler({}, ctx);
+
+	const toolCallHandlers = mock.events.get("tool_call") ?? [];
+	assert.ok(toolCallHandlers.length > 0, "the shell gate must be registered on tool_call");
+	for (const handler of toolCallHandlers) {
+		const run = async (toolName: string, command: string) => {
+			const result = await handler({ toolName, input: { command } }, ctx);
+			return result as { block?: boolean } | undefined;
+		};
+
+		for (const command of [
+			// The planning set: these must keep working.
+			"git status --short",
+			"git log --oneline -5",
+			"git diff --stat",
+			"cat f",
+			"grep -rn x .",
+			// A path *argument* is fine: only the first token is inspected.
+			"cat ./Makefile",
+			"grep -rn x ./src",
+			// The read-only listing forms of git branch and git remote.
+			"git branch",
+			"git branch --show-current",
+			"git remote -v",
+			"git remote show origin",
+			"sed -n '1,20p' f",
+		]) {
+			for (const toolName of ["bash", "powershell"]) {
+				assert.equal(
+					(await run(toolName, command))?.block,
+					undefined,
+					`${toolName} must allow: ${command}`,
+				);
+			}
+		}
+
+		for (const command of [
+			// A path-shaped first token whose leading word is allowlisted used to pass
+			// the prefix patterns and run the real binary.
+			"cat/../../bin/rm -rf x",
+			"ls/../../usr/bin/rm -rf x",
+			"cat/../rm -rf x",
+			// The mutating forms of the two listing commands, `--output` (writes a
+			// file), and sed's in-place and script-file flags.
+			"git branch -D main",
+			"git branch -d feature",
+			"git remote add origin http://x",
+			"git remote rename a b",
+			"git log --output=/tmp/x.txt",
+			"git diff --output /tmp/x.txt",
+			"sed -i 's/a/b/' f",
+			"sed -n -i 's/a/Z/' f",
+			"sed --in-place 's/a/b/' f",
+			"sed -n -f script.sed f",
+		]) {
+			for (const toolName of ["bash", "powershell"]) {
+				assert.equal(
+					(await run(toolName, command))?.block,
+					true,
+					`${toolName} must block: ${command}`,
+				);
+			}
 		}
 	}
 });
@@ -441,6 +577,50 @@ test("isSafePowerShellCommand keeps the POSIX union and refuses PowerShell mutat
 	assert.equal(isSafePowerShellCommand("Set-Content -Path x -Value y"), false);
 	assert.equal(isSafePowerShellCommand("Get-Credential"), false);
 	assert.equal(isSafePowerShellCommand(""), false);
+});
+
+test("isSafeCommand refuses path-shaped heads, mutating git forms, and in-place sed", () => {
+	// Path arguments stay allowed; only a path-shaped first token is refused.
+	assert.equal(isSafeCommand("cat ./Makefile"), true);
+	assert.equal(isSafeCommand("grep -rn x ./src"), true);
+	assert.equal(isSafeCommand("cat/../../bin/rm -rf x"), false);
+	assert.equal(isSafeCommand("ls/../../usr/bin/rm -rf x"), false);
+	assert.equal(isSafeCommand("cat/../rm -rf x"), false);
+
+	// The read-only listing forms of `git branch` and `git remote`.
+	assert.equal(isSafeCommand("git branch"), true);
+	assert.equal(isSafeCommand("git branch -a"), true);
+	assert.equal(isSafeCommand("git branch -v"), true);
+	assert.equal(isSafeCommand("git branch --show-current"), true);
+	assert.equal(isSafeCommand("git remote -v"), true);
+	assert.equal(isSafeCommand("git remote show origin"), true);
+	assert.equal(isSafeCommand("git remote get-url origin"), true);
+
+	assert.equal(isSafeCommand("git branch -D main"), false);
+	assert.equal(isSafeCommand("git branch -d feature"), false);
+	assert.equal(isSafeCommand("git branch -m old new"), false);
+	assert.equal(isSafeCommand("git branch --set-upstream-to=origin/main"), false);
+	// The listing forms with a pattern argument are refused on purpose: the
+	// pattern is indistinguishable from an argument to a mutating verb here.
+	assert.equal(isSafeCommand("git branch --list 'feat/*'"), false);
+	assert.equal(isSafeCommand("git remote add origin http://x"), false);
+	assert.equal(isSafeCommand("git remote remove origin"), false);
+	assert.equal(isSafeCommand("git remote set-url origin http://x"), false);
+
+	// `--output` writes a file in git log/diff/show.
+	assert.equal(isSafeCommand("git log --output=/tmp/x.txt"), false);
+	assert.equal(isSafeCommand("git diff --output /tmp/x.txt"), false);
+
+	// sed rewrites in place with `-i` in any combination, and `-f` runs a script.
+	assert.equal(isSafeCommand("sed -n '1,20p' f"), true);
+	assert.equal(isSafeCommand("sed -i 's/a/b/' f"), false);
+	assert.equal(isSafeCommand("sed -n -i 's/a/Z/' f"), false);
+	assert.equal(isSafeCommand("sed -ni 's/a/Z/' f"), false);
+	assert.equal(isSafeCommand("sed -i.bak 's/a/b/' f"), false);
+	assert.equal(isSafeCommand("sed --in-place 's/a/b/' f"), false);
+	assert.equal(isSafeCommand("sed -n -f script.sed f"), false);
+	// A quoted script that merely mentions `-i` is not a flag.
+	assert.equal(isSafeCommand("sed -n 's/-i/x/p' f"), true);
 });
 
 test("isSafeCommand permits read-only commands and blocks mutating commands", () => {
