@@ -235,6 +235,10 @@ const MUTATING_BASH_PATTERNS = [
 	/(^|[^<])>(?!>)/,
 	/>>/,
 	/\bnpm\s+(install|uninstall|update|ci|link|publish|version)\b/i,
+	// `npm audit` is allowlisted below for its report; its `fix` subcommand rewrites
+	// the workspace (it installs packages and edits the lockfile), so both spellings of
+	// the subcommand are named here and the report form stays allowed.
+	/\bnpm\s+audit\s+(?:fix\b|--fix\b)/i,
 	/\byarn\s+(add|remove|install|publish|upgrade)\b/i,
 	/\bpnpm\s+(add|remove|install|publish|update)\b/i,
 	/\bbun\s+(add|remove|install|update|publish)\b/i,
@@ -259,7 +263,13 @@ const SAFE_BASH_PATTERNS = [
 	// command that names no mutating word (`curl`, `shred`, `gzip` are all missing
 	// from the list below). Field extraction is covered by `cut`, `grep -o`, and the
 	// print-only `sed` grammar instead.
-	/^\s*(cat|head|tail|less|more|grep|find|ls|pwd|echo|printf|wc|sort|uniq|diff|file|stat|du|df|tree|which|whereis|type|env|printenv|uname|whoami|id|date|uptime|ps|jq|rg|fd|bat|eza)\b/i,
+	// `env` and `less` are deliberately absent. `env` is a launcher, not a reader:
+	// `env cmd …`, `env VAR=1 cmd …`, and `env -S 'cmd …'` all hand the guards below a
+	// command word that is not the one they judge, and stripping the prefix to re-judge
+	// the rest would be one more parser to get wrong. `less` is an interactive pager
+	// that writes a file with `-o`/`--log-file` and runs editor/shell commands from its
+	// keyboard; `more` stays, because its only argv writes are its help/version output.
+	/^\s*(cat|head|tail|more|grep|find|ls|pwd|echo|printf|wc|sort|uniq|diff|file|stat|du|df|tree|which|whereis|type|printenv|uname|whoami|id|date|uptime|ps|jq|rg|fd|bat|eza)\b/i,
 	/^\s*sed\s+-n\b/i,
 	/^\s*cd\b/i,
 	// Read-only text and checksum tools: every one of them writes to stdout only.
@@ -305,7 +315,6 @@ const PURE_READ_BASH_COMMANDS: ReadonlySet<string> = new Set([
 	"cat",
 	"head",
 	"tail",
-	"less",
 	"more",
 	"grep",
 	"rg",
@@ -1383,9 +1392,22 @@ export function isSafeCommand(command: string) {
 	const trimmed = command.trim();
 	if (!trimmed) return false;
 
+	// Bash rewrites the command line before any program sees it: quotes disappear, an
+	// unquoted backslash escapes the next character, and `$'…'` is decoded to bytes. A
+	// guard that reads only the raw text can therefore be evaded by spelling the same
+	// command differently — `git log --outpu\t=/tmp/x` reaches git as `--output=/tmp/x`,
+	// `find dir \-delete` as `-delete`, and `sort $'\055o' f` as `sort -o f`. Every
+	// segment is judged twice for that reason (see judgeSafeCommand), and a refusal from
+	// either reading stands. Normalizing is no substitute for the raw text either:
+	// `cat My\ File.txt` normalizes to `cat My File.txt` and stays allowed, while the raw
+	// text keeps a quoted search pattern quoted (`grep -rn 'rm -rf' .`).
+	return judgeSafeCommand(trimmed);
+}
+
+function judgeSafeCommand(command: string) {
 	// Treat newlines as command separators so a second line cannot smuggle a
 	// mutating command past the per-segment allowlist check.
-	const singleLine = trimmed.replace(/\n+/g, "; ");
+	const singleLine = command.replace(/\n+/g, "; ");
 
 	// Strip quoted strings: words inside quotes are search patterns or text, not
 	// commands to execute ("grep -rn 'rm -rf' ." must be allowed).
@@ -1415,8 +1437,6 @@ export function isSafeCommand(command: string) {
 	// whitespace, or the end of the command. The price is a false denial in the safe
 	// direction: the bare word is refused too, so a search for the literal text
 	// `--output` needs the bracket form (`grep -rn -- '--outpu[t]' .`).
-	if (/(?:^|[\s'"])--ou(?:t(?:p(?:u(?:t)?)?)?)?(?:=|\s|['"]|$)/i.test(singleLine)) return false;
-
 	// Every pipeline stage / ; / && / || branch must independently pass the
 	// allowlist. This stops "grep foo | xargs rm", "echo hi | bash",
 	// "cd / && rm -rf /" and friends from hiding behind a read-only first word.
@@ -1424,88 +1444,340 @@ export function isSafeCommand(command: string) {
 	if (segments.length === 0) return false;
 
 	for (const segment of segments) {
-		// A first token with a path separator is a path, not a command word. The
-		// patterns below are prefix-anchored, so without this guard a path whose
-		// leading word is allowlisted (`cat/../../bin/rm -rf x`) would be waved
-		// through, and Windows accepts `/` as a separator. Path *arguments* such as
-		// `cat ./Makefile` are unaffected: only the first token is inspected.
-		if (hasPathShapedHead(segment)) return false;
-		if (!SAFE_BASH_PATTERNS.some((pattern) => pattern.test(segment))) return false;
-
-		const head = firstCommandWord(segment);
-		if (!head) continue;
-
-		// Head-specific guards run before the inert-argument shortcut below, because a
-		// command that is read-only by construction can still carry a flag that writes
-		// (`sort -o out`).
-		//
-		// find can mutate via -delete/-exec/-ok (and their -execdir/-okdir forms) and
-		// writes a file through -fprint/-fprint0/-fprintf/-fls; other flags are
-		// read-only, so a search for a file named "rm" must not trip the keyword list.
-		// The left boundary accepts a quote for the same reason the sort and `--output`
-		// checks do: `find dir "-delete"` reaches find as `-delete`.
-		if (head === "find") {
-			if (/(?:^|[\s'"])-(?:delete|exec|execdir|ok|okdir|fprintf|fprint0?|fls)\b/i.test(segment))
-				return false;
-			continue;
-		}
-
-		// sed edits in place with `-i` (in any combination, including `-ni` and
-		// `-i.bak`), `-f`/`--file` runs a script file whose commands this allowlist
-		// cannot see, and `-e`/`--expression` adds a second script that only the first
-		// one would be checked against; `sed -n -i 's/a/Z/' f` empties a file. Quoted
-		// text is dropped first, because a `-i` inside a script or pattern is not a
-		// flag.
-		if (head === "sed") {
-			const sedFlags = segment.replace(/"[^"]*"|'[^']*'/g, " ");
-			if (
-				/(?:^|\s)(?:--in-place\b|--file\b|-f\b|-e\b|--expression\b|-[a-zA-Z.]*i[a-zA-Z.]*)/i.test(
-					sedFlags,
-				)
-			)
-				return false;
-			// The flags are not the whole hazard: a script can write files (the `w`/`W`
-			// command, `s///w file`) and run commands (GNU's `e` command, `s///e`), and
-			// that is exactly the text the flag check above drops. Telling a read-only
-			// script from a writing one needs a full sed grammar, so the script argument
-			// is allowlisted instead: numeric or `$` addresses followed by `p`,
-			// `;`-joined. Everything else is refused — including substitution and regex
-			// addresses, so `sed -n '/x/p' f` needs `grep` instead. That loss is the price
-			// of keeping this entry sound.
-			const sedScript = (
-				segment.match(/^\s*sed\s+-n(?:\s+(?:--|-[a-zA-Z.]+))*\s+(\S+)/i)?.[1] ?? ""
-			).replace(/^(['"])([\s\S]*)\1$/, "$2");
-			if (!/^(?:\d+|\$)?(?:,(?:\d+|\$)?)?p(?:;(?:\d+|\$)?(?:,(?:\d+|\$)?)?p)*$/.test(sedScript))
-				return false;
-		}
-
-		// sort is argument-inert but not flag-inert: `-o FILE` and `--output=FILE`
-		// write a file, and `--compress-program` runs a program. The redirect check
-		// above cannot see a handle a command opens itself, so the flags are judged per
-		// whitespace-split token with a leading quote peeled off: `sort "-o" out f`
-		// reaches sort as `-o out`, and a short bundle hides the flag behind other
-		// letters (`sort -nroOUT f` is `-o OUT`). Long options are accepted by
-		// unambiguous prefix, so the `--out`/`--comp`/`--temp` families are refused as
-		// words rather than matched in full; sort has no other option under those
-		// prefixes (`--out` is `--output`, `--comp` is `--compress-program`, `--temp`
-		// is `--temporary-directory`).
-		if (head === "sort") {
-			for (const rawToken of segment.split(/\s+/)) {
-				const token = rawToken.replace(/^['"]+/, "");
-				if (/^-[a-zA-Z]*[oT]/.test(token)) return false;
-				if (/^--(?:out|comp|temp)/i.test(token)) return false;
-			}
-		}
-
-		if (PURE_READ_BASH_COMMANDS.has(head)) continue;
-
-		// Non-pure-read heads (echo, printf, git, npm, env, ...) are checked against
-		// the mutating keywords on the full segment text (quotes intact) — e.g.
-		// `git log --grep='npm install' -5` stays blocked.
-		const segmentNoFdRedirs = segment.replace(/\b[012]>&[012]\b/g, "");
-		if (MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(segmentNoFdRedirs))) return false;
+		if (!judgeSegment(segment, "raw")) return false;
+		// The same decision is made again on the bash-normalized reading of the segment.
+		// Escaping cannot create a separator (a quoted `;` reaches the program as an
+		// argument, not as command syntax), so the boundaries the raw text established
+		// still hold — but `find dir \-delete`, `sort $'\055o' f` and
+		// `git log --outpu\t=/tmp/x` resolve here to the flags they really are, and a
+		// refusal from either reading stands.
+		const normalized = bashNormalized(segment);
+		if (normalized !== segment && !judgeSegment(normalized, "normalized")) return false;
 	}
 	return true;
+}
+
+/**
+ * Judge one command segment: its command word, its flags, and any mutating keyword
+ * that survived the allowlist. It runs for the raw segment and again for the
+ * normalized reading of that segment, so each spelling has to pass on its own while
+ * the head is resolved the way bash resolves it. `reading` names which of the two is
+ * being judged: a check that counts words has to say so, because the normalized text
+ * has lost the quotes that hold one argument together.
+ */
+function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
+	// A first token with a path separator is a path, not a command word. The
+	// patterns below are prefix-anchored, so without this guard a path whose
+	// leading word is allowlisted (`cat/../../bin/rm -rf x`) would be waved
+	// through, and Windows accepts `/` as a separator. Path *arguments* such as
+	// `cat ./Makefile` are unaffected: only the first token is inspected.
+	if (hasPathShapedHead(segment)) return false;
+	if (!SAFE_BASH_PATTERNS.some((pattern) => pattern.test(segment))) return false;
+
+	const head = firstCommandWord(segment);
+	if (!head) return true;
+
+	// `git log --output=x` writes x (same for `git diff`/`git show`), and no
+	// read-only command in the allowlist takes an output-file flag. A quote may sit
+	// between the separator and the dashes: quoting a flag does not stop the command
+	// from consuming it (`git log "--output=/tmp/x" f` reaches git as
+	// `--output=/tmp/x`). Git resolves long options by unambiguous prefix, so the
+	// short spellings `--out=`, `--outp=`, and `--outpu=` write the same file and are
+	// refused as one family; `--output-indicator-*` is a different git log option and
+	// stays allowed, because the follow set after the matched prefix is `=`, a quote,
+	// whitespace, or the end of the command. The price is a false denial in the safe
+	// direction: the bare word is refused too, so a search for the literal text
+	// `--output` needs the bracket form (`grep -rn -- '--outpu[t]' .`).
+	if (/(?:^|[\s'"])--ou(?:t(?:p(?:u(?:t)?)?)?)?(?:=|\s|['"]|$)/i.test(segment)) return false;
+
+	// Head-specific guards run before the inert-argument shortcut below, because a
+	// command that is read-only by construction can still carry a flag that writes
+	// (`sort -o out`).
+	//
+	// find can mutate via -delete/-exec/-ok (and their -execdir/-okdir forms) and
+	// writes a file through -fprint/-fprint0/-fprintf/-fls; other flags are
+	// read-only, so a search for a file named "rm" must not trip the keyword list.
+	// The left boundary accepts a quote for the same reason the sort and `--output`
+	// checks do: `find dir "-delete"` reaches find as `-delete`.
+	if (head === "find") {
+		if (/(?:^|[\s'"])-(?:delete|exec|execdir|ok|okdir|fprintf|fprint0?|fls)\b/i.test(segment))
+			return false;
+		return true;
+	}
+
+	// sed edits in place with `-i` (in any combination, including `-ni` and
+	// `-i.bak`), `-f`/`--file` runs a script file whose commands this allowlist
+	// cannot see, and `-e`/`--expression` adds a second script that only the first
+	// one would be checked against; `sed -n -i 's/a/Z/' f` empties a file. Quoted
+	// text is dropped first, because a `-i` inside a script or pattern is not a
+	// flag.
+	if (head === "sed") {
+		const sedFlags = segment.replace(/"[^"]*"|'[^']*'/g, " ");
+		if (
+			/(?:^|\s)(?:--in-place\b|--file\b|-f\b|-e\b|--expression\b|-[a-zA-Z.]*i[a-zA-Z.]*)/i.test(
+				sedFlags,
+			)
+		)
+			return false;
+		// The flags are not the whole hazard: a script can write files (the `w`/`W`
+		// command, `s///w file`) and run commands (GNU's `e` command, `s///e`), and
+		// that is exactly the text the flag check above drops. Telling a read-only
+		// script from a writing one needs a full sed grammar, so the script argument
+		// is allowlisted instead: numeric or `$` addresses followed by `p`,
+		// `;`-joined. Everything else is refused — including substitution and regex
+		// addresses, so `sed -n '/x/p' f` needs `grep` instead. That loss is the price
+		// of keeping this entry sound.
+		const sedScript = (
+			segment.match(/^\s*sed\s+-n(?:\s+(?:--|-[a-zA-Z.]+))*\s+(\S+)/i)?.[1] ?? ""
+		).replace(/^(['"])([\s\S]*)\1$/, "$2");
+		if (!/^(?:\d+|\$)?(?:,(?:\d+|\$)?)?p(?:;(?:\d+|\$)?(?:,(?:\d+|\$)?)?p)*$/.test(sedScript))
+			return false;
+	}
+
+	// sort is argument-inert but not flag-inert: `-o FILE` and `--output=FILE`
+	// write a file, `--compress-program` runs a program, and `--temporary-directory`
+	// picks where the spills land. sort accepts a long option at any unambiguous
+	// prefix (`--o`, `--ou`, `--out`, `--outp`, …), so the families are matched by
+	// prefix rather than by full spelling, and a short bundle is scanned per letter
+	// (`sort -nroOUT f` is `-o OUT`).
+	if (head === "sort") {
+		if (hasDangerousShortFlag(segment, "oT")) return false;
+		if (hasDangerousLongOption(segment, SORT_WRITE_OPTIONS)) return false;
+	}
+
+	// rg runs the `--pre`/`--pre-glob` command for every file it scans, and fd runs
+	// whatever `-x`/`-X`/`--exec`/`--exec-batch` name. Both sit in
+	// PURE_READ_BASH_COMMANDS, so nothing else looks at their flags.
+	if (head === "rg" && hasDangerousLongOption(segment, RG_EXEC_OPTIONS)) return false;
+	if (head === "fd") {
+		if (hasDangerousShortFlag(segment, "xX")) return false;
+		if (hasDangerousLongOption(segment, FD_EXEC_OPTIONS)) return false;
+	}
+
+	// tree writes its listing with `-o FILE`/`--output FILE`, date moves the system
+	// clock with `-s`/`--set`, and bat starts a pager program (`--pager`) or reads a
+	// program out of a config file (`--config-file`).
+	if (head === "tree") {
+		if (hasDangerousShortFlag(segment, "o")) return false;
+		if (hasDangerousLongOption(segment, TREE_WRITE_OPTIONS)) return false;
+	}
+	if (head === "date") {
+		if (hasDangerousShortFlag(segment, "s")) return false;
+		if (hasDangerousLongOption(segment, DATE_SET_OPTIONS)) return false;
+	}
+	if (head === "bat" && hasDangerousLongOption(segment, BAT_EXEC_OPTIONS)) return false;
+
+	// `uniq` takes its output file as a positional argument (`uniq INPUT OUTPUT`), so a
+	// second non-flag word is a write handle rather than a second input. Words are
+	// matched with quotes respected (`uniq "my file.txt"` is one argument), and only on
+	// the raw text: bash merges arguments when it quotes or escapes, never the other way
+	// around, so the raw word count can only over-count — and the normalized reading has
+	// already dropped the quotes, which would make one quoted filename look like two
+	// words and refuse a read.
+	if (head === "uniq" && reading === "raw") {
+		const words = segment.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+		if (words.slice(1).filter((word) => !word.startsWith("-")).length > 1) return false;
+	}
+
+	// git reads a program out of configuration for a handful of flags: `--ext-diff`
+	// and `--textconv` run the configured diff driver, `--filters` runs the clean
+	// filter, `-O`/`--open-files-in-pager` pipes output into a command, `--paginate`
+	// starts the configured pager, and `--help` starts `man`. `git -c …`/
+	// `--config-env=…` never get past the allowlist, but these flags need no override of
+	// their own — they reach a program the user configured earlier — so they are refused
+	// by name. Plain `git diff` still runs a program if the *repository* config names one
+	// (`diff.external`, a `diff=` driver in `.gitattributes`, `core.fsmonitor` for
+	// `git status`, `gpg.program` for `log.showSignature`): no flag is involved there, so
+	// it is out of reach for this judge and documented as a limitation instead.
+	if (head === "git") {
+		if (hasDangerousShortFlag(segment, "O")) return false;
+		if (hasDangerousLongOption(segment, GIT_EXEC_OPTIONS)) return false;
+	}
+
+	if (PURE_READ_BASH_COMMANDS.has(head)) return true;
+
+	// Non-pure-read heads (echo, printf, git, npm, env, ...) are checked against
+	// the mutating keywords on the full segment text (quotes intact) — e.g.
+	// `git log --grep='npm install' -5` stays blocked.
+	const segmentNoFdRedirs = segment.replace(/\b[012]>&[012]\b/g, "");
+	if (MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(segmentNoFdRedirs))) return false;
+
+	return true;
+}
+
+/**
+ * Rewrite a command the way bash does before it hands arguments to a program:
+ * remove quotes, resolve unquoted backslash escapes, and decode `$'…'` ANSI-C
+ * strings (including `\xNN`, `\NNN`, `\t`, and `\n`). Escapes this does not know
+ * are kept as written, which is what bash does too. The result is used only as a
+ * second reading of the same command line.
+ */
+export function bashNormalized(command: string): string {
+	let out = "";
+	let i = 0;
+	while (i < command.length) {
+		const char = command[i];
+		if (char === "'") {
+			// Single quotes are literal: nothing inside is escaped or expanded.
+			const end = command.indexOf("'", i + 1);
+			if (end === -1) {
+				out += command.slice(i + 1);
+				break;
+			}
+			out += command.slice(i + 1, end);
+			i = end + 1;
+			continue;
+		}
+		if (char === "$" && command[i + 1] === "'") {
+			const [decoded, next] = decodeAnsiCString(command, i + 2);
+			out += decoded;
+			i = next;
+			continue;
+		}
+		if (char === '"') {
+			i += 1;
+			while (i < command.length && command[i] !== '"') {
+				// Inside double quotes only `\`, `$`, `` ` `` and a newline can be escaped.
+				if (command[i] === "\\" && '"\\$`'.includes(command[i + 1] ?? "")) i += 1;
+				out += command[i];
+				i += 1;
+			}
+			i += 1;
+			continue;
+		}
+		if (char === "\\") {
+			const escaped = command[i + 1];
+			if (escaped === undefined) break;
+			// Backslash-newline is a line continuation: bash removes both characters.
+			if (escaped !== "\n") out += escaped;
+			i += 2;
+			continue;
+		}
+		out += char;
+		i += 1;
+	}
+	return out;
+}
+
+/** Decode a `$'…'` string starting after its opening quote; returns the text and the index after the closing quote. */
+function decodeAnsiCString(command: string, start: number): [string, number] {
+	const simple: Record<string, string> = {
+		a: "\x07",
+		b: "\b",
+		e: "\x1b",
+		E: "\x1b",
+		f: "\f",
+		n: "\n",
+		r: "\r",
+		t: "\t",
+		v: "\v",
+		"\\": "\\",
+		"'": "'",
+		'"': '"',
+	};
+	let out = "";
+	let i = start;
+	while (i < command.length) {
+		const char = command[i];
+		if (char === "'") return [out, i + 1];
+		if (char !== "\\") {
+			out += char;
+			i += 1;
+			continue;
+		}
+		const escaped = command[i + 1];
+		if (escaped === undefined) return [out, i + 1];
+		if (escaped in simple) {
+			out += simple[escaped];
+			i += 2;
+			continue;
+		}
+		if (escaped === "x") {
+			const hex = /^[0-9a-fA-F]{1,2}/.exec(command.slice(i + 2))?.[0];
+			if (hex) {
+				out += String.fromCharCode(Number.parseInt(hex, 16));
+				i += 2 + hex.length;
+				continue;
+			}
+		}
+		if (escaped >= "0" && escaped <= "7") {
+			const octal = /^[0-7]{1,3}/.exec(command.slice(i + 1))?.[0] ?? "";
+			out += String.fromCharCode(Number.parseInt(octal, 8));
+			i += 1 + octal.length;
+			continue;
+		}
+		if (escaped === "u" || escaped === "U") {
+			const width = escaped === "u" ? 4 : 8;
+			const hex = new RegExp(`^[0-9a-fA-F]{1,${width}}`).exec(command.slice(i + 2))?.[0];
+			const codePoint = hex ? Number.parseInt(hex, 16) : Number.NaN;
+			if (hex && codePoint <= 0x10ffff) {
+				out += String.fromCodePoint(codePoint);
+				i += 2 + hex.length;
+				continue;
+			}
+		}
+		if (escaped === "c") {
+			const control = command[i + 2];
+			if (control) {
+				out += String.fromCharCode(control.toUpperCase().charCodeAt(0) ^ 64);
+				i += 3;
+				continue;
+			}
+		}
+		// Bash keeps the backslash for an escape it does not know.
+		out += `\\${escaped}`;
+		i += 2;
+	}
+	return [out, i];
+}
+
+// Options that turn a read-only command into a launcher or a writer. Each list is
+// matched by prefix (see hasDangerousLongOption), so it covers the abbreviated
+// spellings these parsers accept as well as the full ones.
+const SORT_WRITE_OPTIONS = ["--output", "--compress-program", "--temporary-directory"];
+const RG_EXEC_OPTIONS = ["--pre", "--pre-glob"];
+const FD_EXEC_OPTIONS = ["--exec", "--exec-batch"];
+const TREE_WRITE_OPTIONS = ["--output"];
+const DATE_SET_OPTIONS = ["--set"];
+// bat starts a pager program with `--pager`, and `--config-file` can point at a file
+// whose contents name one (a file the caller may be able to write).
+const BAT_EXEC_OPTIONS = ["--pager", "--config-file"];
+const GIT_EXEC_OPTIONS = [
+	"--open-files-in-pager",
+	"--ext-diff",
+	"--textconv",
+	"--filters",
+	"--paginate",
+	// `git log --help` hands the terminal to `man`, which starts the configured
+	// pager, so the help flag is a launcher like the rest.
+	"--help",
+];
+
+/**
+ * A long option may be abbreviated to any unambiguous prefix (`--o`, `--ou`,
+ * `--out` and `--output` are the same flag to sort), so a token is refused when its
+ * option part — the text before `=` — is a prefix of one of the dangerous options.
+ * Comparing against the full names covers every abbreviation without listing them,
+ * and the full spelling with them.
+ */
+function hasDangerousLongOption(segment: string, options: readonly string[]): boolean {
+	for (const rawToken of segment.split(/\s+/)) {
+		const token = rawToken.replace(/^['"]+/, "").toLowerCase();
+		if (!token.startsWith("--")) continue;
+		const equals = token.indexOf("=");
+		const option = equals === -1 ? token : token.slice(0, equals);
+		if (option.length > 2 && options.some((dangerous) => dangerous.startsWith(option))) return true;
+	}
+	return false;
+}
+
+/**
+ * Short flags can share one token (`sort -nroOUT f` is `-o OUT`), so every letter of
+ * every short-flag token is checked against the dangerous set.
+ */
+function hasDangerousShortFlag(segment: string, letters: string): boolean {
+	const pattern = new RegExp(`^-[a-zA-Z]*[${letters}]`);
+	return segment.split(/\s+/).some((rawToken) => pattern.test(rawToken.replace(/^['"]+/, "")));
 }
 
 // PowerShell needs its own dialect. The POSIX allowlist matches whole command

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import planMode, {
+	bashNormalized,
 	canSelectToolInPlanMode,
 	completePlanArguments,
 	isContextManagementTool,
@@ -589,7 +590,19 @@ test("the shared command judge refuses path-shaped heads and mutating git/sed fo
 			// `--output-indicator-*` is a different git log option, so the `--output`
 			// abbreviation family above must not swallow it.
 			"git log --output-indicator-new=+ -1",
+			// A git flag that merely starts with the letters of a guarded one stays allowed:
+			// the match runs the other way (a token that is a prefix of a full option name).
+			"git diff --histogram",
 			"find src -printf '%p'",
+			// Escaping does not change a verdict: a backslash inside a path, a quoted search
+			// pattern, and a single positional argument all stay read-only.
+			"cat My\\ File.txt",
+			"grep -rn 'rm -rf' .",
+			"uniq f",
+			"uniq -c f",
+			"uniq 'my file.txt'",
+			// `env` is refused while its read-only sibling stays available.
+			"printenv PATH",
 		]) {
 			for (const toolName of ["bash", "powershell"]) {
 				assert.equal(
@@ -663,6 +676,47 @@ test("the shared command judge refuses path-shaped heads and mutating git/sed fo
 			'find dir "-delete"',
 			"find dir '-fprintf' /tmp/x '%p'",
 			"find dir '-exec' /bin/touch /tmp/x ';'",
+			// Escaping a flag does not hide it: bash removes the unquoted backslash and
+			// decodes `$'…'`, so the predicate arrives at find as `-delete`.
+			"find /tmp/d \\-delete",
+			"find $'\\055delete'",
+			// The launcher `env` would make every head-keyed guard judge the wrong word, so
+			// `env` itself is not allowlisted — the read case is refused with the rest.
+			"env git tag -d v1",
+			"env find /tmp/x -delete",
+			"env sort -o /tmp/x f",
+			"env awk -f x y",
+			'env python3 -c \'open("f","w").write(1)\'',
+			"env sh script",
+			"env rg --pre /tmp/x a f",
+			"env grep -n foo f",
+			"env FOO=bar grep -n foo f",
+			// Other wrappers that run their argument were never allowlisted.
+			"command git status",
+			"nohup git log",
+			"xargs rm",
+			"nice git log",
+			"stdbuf -o0 git log",
+			"perl -e 'print 1'",
+			"ruby -e 'print 1'",
+			// git flags that hand control to a program git reads from configuration: the
+			// external diff drivers, the clean filter, and the two pager paths.
+			"git grep -O x",
+			"git grep --open-files-in-pager=/tmp/x a",
+			"git log --ext-diff",
+			"git diff --textconv",
+			"git cat-file --filters HEAD",
+			"git log --paginate -1",
+			// An unambiguous abbreviation reaches the same code path.
+			"git log --ext",
+			"git show --textc",
+			"git grep --open /tmp/x a",
+			// `--help` starts the man viewer, which starts the pager; the abbreviations of
+			// it are launchers too.
+			"git log --help",
+			"git log --hel",
+			// The escape spelling lands on `--output=` after bash decodes `\t`.
+			"git log --outpu\\t=/tmp/G2 -1",
 			"awk -f prog.awk f",
 			'awk "-f" prog.awk f',
 			// awk is not allowlisted at all: an interpreter cannot be made read-only by
@@ -703,10 +757,105 @@ test("the shared command judge refuses path-shaped heads and mutating git/sed fo
 			"sort -rT /tmp f",
 			"sort --temp=/tmp f",
 			"sort '-o' /tmp/x f",
+			// GNU sort accepts any unambiguous prefix of a long option, so the family is
+			// matched by prefix: `--o`, `--co` (compress-program), and `--t` all write.
+			"sort --o /tmp/x f",
+			"sort --o= f",
+			"sort --co=/bin/sh f",
+			"sort --t=/tmp f",
+			"sort --tem=/tmp f",
+			// An empty value is still a value: the flag was consumed and the argument that
+			// follows is no longer where the caller meant it to be.
+			'sort --o "" f',
+			'sort -o "" f',
+			// A backslash or an ANSI-C escape hides the same flag from the raw text.
+			"sort -\\o x2 f",
+			"sort $'\\055o' x3 f",
 		]) {
 			assert.equal((await run("bash", command))?.block, true, `bash must block: ${command}`);
 		}
 		assert.equal((await run("bash", "sort -n f"))?.block, undefined, "bash must allow: sort -n f");
+	}
+});
+
+test("bashNormalized resolves the spellings bash resolves", () => {
+	// The normalizer is a second reading of the same segment, so it has to reproduce
+	// what bash hands to the program: `$'…'` is decoded, an unquoted backslash loses
+	// itself, and quotes are dropped while the text they held is kept.
+	assert.equal(bashNormalized("sort $'\\055o' x f"), "sort -o x f");
+	assert.equal(bashNormalized("find d \\-delete"), "find d -delete");
+	assert.equal(bashNormalized("git log --outpu\\t=/tmp/x -1"), "git log --output=/tmp/x -1");
+	assert.equal(bashNormalized("cat My\\ File.txt"), "cat My File.txt");
+	assert.equal(bashNormalized("grep -n 'a b' f"), "grep -n a b f");
+	assert.equal(bashNormalized('git log --grep="rm -rf" f'), "git log --grep=rm -rf f");
+	// A command with nothing to normalize is returned unchanged, which is what lets the
+	// gate skip the second judgement for it.
+	assert.equal(bashNormalized("git status"), "git status");
+});
+
+test("isSafeCommand refuses exec-vector flags and the launchers that hide a head", () => {
+	// `rg --pre` runs a command per file, `fd -x` runs one per match, and both sit in
+	// PURE_READ_BASH_COMMANDS so nothing else looks at their flags.
+	for (const command of [
+		"rg --pre /tmp/x a f",
+		"rg --pre-glob '*.sh' --pre x a f",
+		"rg --pre=/tmp/x a f",
+		"rg --pr /tmp/x a f",
+		"fd -x rm",
+		"fd -X rm",
+		"fd --exec rm",
+		"fd --exec-batch rm",
+		"fd -Hx rm",
+		"fd --exe rm",
+		"ag --pager 'sh -c x' a .",
+		"tree -o /tmp/x",
+		"tree --output=/tmp/x",
+		// `--o` is the unambiguous abbreviation tree accepts for `--output`.
+		"tree --o /tmp/x",
+		"date -s '2020-01-01'",
+		"date --set=x",
+		"bat --pager='sh -c x' f",
+		// `--config-file` can name a file whose contents set `--pager`.
+		"bat --config-file=/tmp/c f",
+		"bat --config-file /tmp/c f",
+		"npm audit fix",
+		"npm audit fix --force",
+		"npm audit --fix",
+		// `uniq INPUT OUTPUT` writes its second positional argument.
+		"uniq u.txt u.out",
+		// git's `-O` / `--open-files-in-pager` hands the output to a command.
+		"git log -O /tmp/order -1",
+		"git log -O/tmp/order -1",
+		"git log --open-files-in-pager -1",
+	]) {
+		assert.equal(isSafeCommand(command), false, `must block: ${command}`);
+	}
+
+	// `less` is refused outright: its own command language writes files (`-o`) and runs
+	// programs (`!cmd`, `|cmd`), so the writable `more` is the pager of record.
+	assert.equal(isSafeCommand("less -o /tmp/x f"), false);
+	assert.equal(isSafeCommand("less --log-file=/tmp/x f"), false);
+	assert.equal(isSafeCommand("less f"), false);
+
+	// What the same commands still do for a planner.
+	for (const command of [
+		"printenv PATH",
+		"rg -n foo f",
+		"npm audit --json",
+		"npm audit --audit-level=high",
+		"npm ls --depth=0",
+		"uniq f",
+		"uniq -c f",
+		"uniq 'my file.txt'",
+		"cat My\\ File.txt",
+		"more f",
+		"bat f",
+		"bat --line-range 1:2 f",
+		"tree src",
+		"date",
+		"find src -name '*.ts'",
+	]) {
+		assert.equal(isSafeCommand(command), true, `must allow: ${command}`);
 	}
 });
 
