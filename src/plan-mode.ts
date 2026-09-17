@@ -1472,6 +1472,15 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 	// through, and Windows accepts `/` as a separator. Path *arguments* such as
 	// `cat ./Makefile` are unaffected: only the first token is inspected.
 	if (hasPathShapedHead(segment)) return false;
+	// Parameter expansion defeats both readings: `sort${IFS}-o OUT f` is one word to
+	// the judge and two words to bash, so no flag check ever sees the `-o`, and
+	// `echo $(git tag -d v2)` runs a command whose text the allowlist never reads.
+	// Modelling expansion would be one more parser to get wrong, so a `$` or a
+	// backtick outside single quotes is refused instead. Single quotes are literal in
+	// bash, which keeps `sed -n '$p' f` and `grep -rn '$' .` allowed; the price is a
+	// false denial for a double-quoted `$` (`grep -rn "$x" .`) and for `$'…'`, both of
+	// which were refused through other paths before this check existed.
+	if (reading === "raw" && /\$|`/.test(segment.replace(/'[^']*'/g, " "))) return false;
 	if (!SAFE_BASH_PATTERNS.some((pattern) => pattern.test(segment))) return false;
 
 	const head = firstCommandWord(segment);
@@ -1977,8 +1986,12 @@ function isAllowedPowerShellHead(head: string, segment: string): boolean {
 	return isSafeCommand(segment);
 }
 
-// Splits a command on unquoted separators (|, ;, &&, ||), so quoted search
-// patterns like "a;b" or "x | y" do not produce phantom segments.
+// Splits a command on unquoted separators (`;`, `&`, `&&`, `||`, `|`, `|&`), so
+// quoted search patterns like "a;b" or "x | y" do not produce phantom segments and a
+// quoted `;` is data rather than a boundary. Backslash escapes are honoured while
+// splitting: an escaped quote is a literal character, not the start of a quoted
+// region (`echo \" ; git tag -d v2` is two commands), and an escaped separator keeps
+// that character inside its segment (`echo a \; b` is one command).
 function splitShellSegments(command: string): string[] {
 	const segments: string[] = [];
 	let current = "";
@@ -1987,7 +2000,26 @@ function splitShellSegments(command: string): string[] {
 		const ch = command[i];
 		if (quote) {
 			current += ch;
+			// Only inside double quotes does a backslash escape the next character, so
+			// `\"` stays inside the string and `\\` does not escape the closing quote.
+			// Single quotes are literal throughout: nothing closes them but a quote.
+			if (ch === "\\" && quote === '"') {
+				const escaped = command[i + 1];
+				if (escaped !== undefined) {
+					current += escaped;
+					i++;
+				}
+				continue;
+			}
 			if (ch === quote) quote = undefined;
+			continue;
+		}
+		// Unquoted, a backslash escapes the next character. Skipping the pair keeps the
+		// quote state honest and keeps an escaped separator out of the split.
+		if (ch === "\\") {
+			const escaped = command[i + 1];
+			current += escaped === undefined ? ch : ch + escaped;
+			i++;
 			continue;
 		}
 		if (ch === '"' || ch === "'") {
@@ -1995,12 +2027,23 @@ function splitShellSegments(command: string): string[] {
 			current += ch;
 			continue;
 		}
-		if (ch === "|" || ch === ";") {
+		// `|` and `|&` separate pipeline stages, `&&`/`||` separate and-or lists, and a
+		// bare `&` backgrounds the command — the following command runs too and has to
+		// be judged on its own. `>&` and `&>` are redirects (already refused below), not
+		// separators.
+		const next = command[i + 1];
+		if (ch === "|") {
+			segments.push(current);
+			current = "";
+			if (next === "|" || next === "&") i++;
+			continue;
+		}
+		if (ch === ";" || (ch === "&" && next !== "&" && next !== ">" && command[i - 1] !== ">")) {
 			segments.push(current);
 			current = "";
 			continue;
 		}
-		if (ch === "&" && command[i + 1] === "&") {
+		if (ch === "&" && next === "&") {
 			segments.push(current);
 			current = "";
 			i++;
@@ -2009,7 +2052,9 @@ function splitShellSegments(command: string): string[] {
 		current += ch;
 	}
 	segments.push(current);
-	return segments;
+	// An empty segment carries no command (`echo hi;`, `a || b` after the operator was
+	// consumed), so it is not a boundary anyone can hide behind.
+	return segments.filter((segment) => segment.trim() !== "");
 }
 
 // True when the segment's first token carries a path separator. Such a token is

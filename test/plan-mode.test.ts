@@ -1095,6 +1095,67 @@ test("isSafeCommand blocks mutations hiding in pipes, redirects, and find flags"
 	assert.equal(isSafeCommand("npm install --save-dev typescript"), false);
 });
 
+test("isSafeCommand refuses hidden separators and unquoted expansion", () => {
+	// An escaped quote is a literal character: it must not open a quoted region that
+	// swallows the separator after it (`echo \" ; git tag -d v2` really deleted a tag).
+	assert.equal(isSafeCommand('echo \\" ; git tag -d v2'), false);
+	assert.equal(isSafeCommand('echo \\" ; sort -o OUT f'), false);
+	assert.equal(isSafeCommand('echo \\" ; find dir -delete'), false);
+	assert.equal(isSafeCommand("echo \\' ; rg --pre=CANARY a f"), false);
+	// A bare `&` backgrounds what precedes it and runs what follows, so the second
+	// command is judged on its own; `|&` pipes both streams the same way. `>&` and
+	// `&>` stay redirects, which the redirect check already refuses.
+	assert.equal(isSafeCommand("cat f & git tag -d v2"), false);
+	assert.equal(isSafeCommand("echo hi & git tag -d v2"), false);
+	assert.equal(isSafeCommand("cat f & sort -o OUT g"), false);
+	assert.equal(isSafeCommand("cat f & find dir -delete"), false);
+	assert.equal(isSafeCommand("cat f & CANARY x"), false);
+	assert.equal(isSafeCommand("cat f |& git tag -d v2"), false);
+	assert.equal(isSafeCommand("cat f &> out.txt"), false);
+	// Parameter expansion is refused rather than modelled: `sort${IFS}-o OUT f` is one
+	// word to this judge and two words to bash, so no flag check ever sees the `-o`.
+	assert.equal(isSafeCommand("sort${IFS}-o OUT f"), false);
+	assert.equal(isSafeCommand("sort$IFS-o OUT f"), false);
+	assert.equal(isSafeCommand("git log${IFS}--output=OUT -1"), false);
+	assert.equal(isSafeCommand("uniq${IFS}f OUT"), false);
+	assert.equal(isSafeCommand("find${IFS}dir${IFS}-delete"), false);
+	assert.equal(isSafeCommand("rg${IFS}--pre=canary a f"), false);
+	assert.equal(isSafeCommand("fd${IFS}-x${IFS}canary f"), false);
+	assert.equal(isSafeCommand("bat${IFS}--pager=canary f"), false);
+	assert.equal(isSafeCommand("find${IFS}.${IFS}-exec${IFS}canary${IFS}+"), false);
+	assert.equal(isSafeCommand("P=git; $P tag -d v2"), false);
+	assert.equal(isSafeCommand('find dir $"\\055delete"'), false);
+
+	// The positive controls: quoting still suppresses a separator, an escaped separator
+	// is an argument rather than a boundary, single-quoted `$` is literal in bash and
+	// stays readable, and read-only pipelines keep working.
+	assert.equal(isSafeCommand("cat My\\ File.txt"), true);
+	assert.equal(isSafeCommand("grep -rn 'rm -rf' ."), true);
+	assert.equal(isSafeCommand("echo 'a; b' ; sort -n f"), true);
+	assert.equal(isSafeCommand('echo "x | y" ; sort -n f'), true);
+	assert.equal(isSafeCommand("sed -n '$p' f"), true);
+	assert.equal(isSafeCommand("grep -rn '$' ."), true);
+	assert.equal(isSafeCommand("echo a \\; git tag -d v2"), true);
+	assert.equal(isSafeCommand("cat f || cat g"), true);
+	assert.equal(isSafeCommand("cat f && cat g"), true);
+	assert.equal(isSafeCommand("cat f |& cat g"), true);
+	assert.equal(isSafeCommand("echo hi;"), true);
+	assert.equal(isSafeCommand("grep foo f 2>&1 | head"), true);
+	assert.equal(isSafeCommand("sort -n f"), true);
+	assert.equal(isSafeCommand("find src -printf '%p'"), true);
+	assert.equal(isSafeCommand("git tag -l"), true);
+	assert.equal(isSafeCommand("git log --format=%s -1"), true);
+	assert.equal(isSafeCommand("git config --get remote.origin.url"), true);
+	assert.equal(isSafeCommand("printenv PATH"), true);
+
+	// A newline separates commands too, so a second line is judged on its own; two
+	// read-only lines and a `#` comment stay allowed (bash runs nothing from them).
+	assert.equal(isSafeCommand("cat f\ncanaryrun"), false);
+	assert.equal(isSafeCommand("ls\nrm -rf x"), false);
+	assert.equal(isSafeCommand("cat f\nls"), true);
+	assert.equal(isSafeCommand("cat f # canaryrun"), true);
+});
+
 test("normalizePlanModeQuestionParams validates question shape", () => {
 	const result = normalizePlanModeQuestionParams({
 		questions: [
