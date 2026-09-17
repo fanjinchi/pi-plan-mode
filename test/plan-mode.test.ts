@@ -1156,6 +1156,85 @@ test("isSafeCommand refuses hidden separators and unquoted expansion", () => {
 	assert.equal(isSafeCommand("cat f # canaryrun"), true);
 });
 
+test("isSafeCommand judges continuations and quote roles the way bash does", () => {
+	// A backslash-newline is a line continuation: bash deletes it before it looks for
+	// words, so `sort -\⏎o OUT f` is `sort -o OUT f` and writes a file. The judge used to
+	// turn the newline into `; ` first and then read the backslash as an escaped
+	// separator, which hid the flag behind a boundary bash never sees.
+	assert.equal(isSafeCommand("sort -\\\no OUT f"), false);
+	assert.equal(isSafeCommand("sort -\\\nT /tmp f"), false);
+	assert.equal(isSafeCommand("git log --outp\\\nut=OUT -1"), false);
+	assert.equal(isSafeCommand("git log -1\\\n --output=OUT"), false);
+	assert.equal(isSafeCommand("git log -\\\n-help"), false);
+	assert.equal(isSafeCommand("find . -\\\nexec canary {} +"), false);
+	assert.equal(isSafeCommand("find . -\\\ndelete"), false);
+	assert.equal(isSafeCommand("date -\\\ns 2020-01-01"), false);
+	assert.equal(isSafeCommand("tree -\\\no OUT"), false);
+	assert.equal(isSafeCommand("bat --pag\\\ner=canary f"), false);
+	assert.equal(isSafeCommand("rg --hostname\\\n-bin=canary f"), false);
+	assert.equal(isSafeCommand("uniq f \\\nOUT"), false);
+
+	// An escaped separator is an argument rather than a boundary, and a quoted separator
+	// or a quoted `$` is text: each of these is one command and stays readable.
+	assert.equal(isSafeCommand("echo a \\; git tag -d v2"), true);
+	assert.equal(isSafeCommand("cat f \\; b"), true);
+	assert.equal(isSafeCommand("echo 'a; b'"), true);
+	assert.equal(isSafeCommand("sort -n f"), true);
+	assert.equal(isSafeCommand("sed -n '$p' f"), true);
+
+	// Expansion can hide inside quoting that is not quoting: an escaped quote is a
+	// literal character and a single quote inside a double-quoted string is just a
+	// character, so `echo \'$(canary)\'` and `echo "' $(canary) '"` really run the
+	// canary. Deleting quote characters by pattern erased the `$(…)` before any check
+	// could see it, which is why the quote roles are now scanned instead.
+	assert.equal(isSafeCommand("echo \\'$(canaryprogram)\\'"), false);
+	assert.equal(isSafeCommand("echo \"' $(canaryprogram) '\""), false);
+	assert.equal(isSafeCommand("echo \\'`canaryprogram`\\'"), false);
+	assert.equal(isSafeCommand("echo \"' `canary` '\""), false);
+	assert.equal(isSafeCommand("echo \\'$(git tag -d v2)\\'"), false);
+	assert.equal(isSafeCommand("echo \"' $(sort -o OUT f) '\""), false);
+	// An escaped `$` is literal to bash, and single-quoted `$` was already literal, so
+	// these stay readable; a double-quoted `$` is refused (see the false-negative note
+	// below).
+	assert.equal(isSafeCommand("echo \\$HOME"), true);
+	assert.equal(isSafeCommand('echo "a\\$b"'), true);
+	assert.equal(isSafeCommand("grep -rn '$' ."), true);
+	assert.equal(isSafeCommand("cat My\\ File.txt"), true);
+	// Documented false negative: a double-quoted `$` is refused even though bash would
+	// expand it into one word only, because the judge will not model expansion.
+	assert.equal(isSafeCommand('grep -rn "$x" .'), false);
+
+	// A redirect hidden behind an escaped quote is still a redirect: `cat f \" > OUT \"`
+	// writes OUT, because the quote is data to bash and the `>` is live.
+	assert.equal(isSafeCommand('cat f \\" > OUT5 \\"'), false);
+	assert.equal(isSafeCommand("cat f \\' > OUT \\'"), false);
+	assert.equal(isSafeCommand('cat f \\" >> OUT \\"'), false);
+	assert.equal(isSafeCommand("cat f \\' >> OUT \\'"), false);
+	assert.equal(isSafeCommand('cat f \\" 2> OUT \\"'), false);
+	assert.equal(isSafeCommand("cat f \\' 2> OUT \\'"), false);
+	// Quoted and escaped `>` characters are arguments, and moving a file descriptor is
+	// not a write.
+	assert.equal(isSafeCommand("cat 'a > b'"), true);
+	assert.equal(isSafeCommand("cat a \\> b"), true);
+	assert.equal(isSafeCommand("cat f 2>&1"), true);
+	assert.equal(isSafeCommand("grep foo f 2>&1 | head"), true);
+	// `echo` is not in the pure-read set, so the mutating-keyword layer still refuses a
+	// quoted `>` there — an over-refusal in the safe direction.
+	assert.equal(isSafeCommand("echo 'a > b'"), false);
+
+	// rg runs `--hostname-bin <program>` to resolve the hostname it prints; measured
+	// with a canary on PATH, both the `=` and the space form start the program. The
+	// family is matched by prefix like the others, so `--hostn=` is refused too even
+	// though rg itself rejects that abbreviation — a false denial in the safe
+	// direction.
+	assert.equal(isSafeCommand("rg --hostname-bin=canaryprogram a f"), false);
+	assert.equal(isSafeCommand("rg --hostname-bin canaryprogram a f"), false);
+	assert.equal(isSafeCommand("rg --hostn=canaryprogram a f"), false);
+	assert.equal(isSafeCommand("rg --pre x a f"), false);
+	assert.equal(isSafeCommand("rg --hidden a f"), true);
+	assert.equal(isSafeCommand("rg -n a f"), true);
+});
+
 test("normalizePlanModeQuestionParams validates question shape", () => {
 	const result = normalizePlanModeQuestionParams({
 		questions: [

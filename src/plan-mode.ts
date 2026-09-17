@@ -1404,26 +1404,125 @@ export function isSafeCommand(command: string) {
 	return judgeSafeCommand(trimmed);
 }
 
+/**
+ * What a character means to the shell. `unquoted` is live syntax: operators separate
+ * commands and a `$` or backtick expands. `single` is literal text (nothing expands or
+ * escapes inside it), `double` is a string that still expands and still honours a
+ * backslash, and `escaped` marks a character a backslash makes literal — the backslash
+ * itself included.
+ */
+type ShellCharRole = "unquoted" | "single" | "double" | "escaped";
+
+/**
+ * One model of bash text for every check in this file: walk the command once, tracking
+ * quote state and backslash escapes the way bash does, and report the role of every
+ * character. The splitter, the expansion check and the redirect check all read these
+ * roles instead of stripping quotes with their own regexes — three regexes were three
+ * models, and the two that deleted quote characters by pattern could not tell an
+ * escaped or already-quoted quote from an opener, so `echo \'$(x)\'` and
+ * `cat f \" > OUT \"` were judged as if those quote characters were real quotes and
+ * the expansion and the redirect stayed invisible.
+ */
+function scanShellText(command: string): ShellCharRole[] {
+	const roles: ShellCharRole[] = new Array(command.length).fill("unquoted");
+	let quote: "'" | '"' | undefined;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		// Outside single quotes a backslash makes the next character literal, so an
+		// escaped quote never opens a string (`echo \" ; git tag -d v2` is two commands)
+		// and an escaped `$` never expands.
+		if (ch === "\\" && quote !== "'") {
+			roles[i] = "escaped";
+			if (i + 1 < command.length) {
+				roles[i + 1] = "escaped";
+				i++;
+			}
+			continue;
+		}
+		if (quote === "'") {
+			roles[i] = "single";
+			if (ch === "'") quote = undefined;
+			continue;
+		}
+		if (quote === '"') {
+			roles[i] = "double";
+			if (ch === '"') quote = undefined;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			roles[i] = ch === "'" ? "single" : "double";
+		}
+	}
+	return roles;
+}
+
+/**
+ * True when the shell would expand something: an unescaped `$` or backtick outside
+ * single quotes, a double-quoted one included (`echo "' $(x) '"` expands).
+ */
+function hasExpansion(command: string): boolean {
+	const roles = scanShellText(command);
+	for (let i = 0; i < command.length; i++) {
+		if (roles[i] === "single" || roles[i] === "escaped") continue;
+		if (command[i] === "$" || command[i] === "`") return true;
+	}
+	return false;
+}
+
+/**
+ * True when the shell would act on a redirect: `>` and `>>` write a file, `&>` and
+ * `>&` write one, and `<<`/`<<<`/`<(...)`/`>(...)` carry a command body. Only the
+ * fd-to-fd forms (`2>&1`, `1>&2`) move a descriptor without writing. Quoted and
+ * escaped characters are data, which keeps `echo 'a > b'` allowed while
+ * `cat f \" > OUT \"` is a write.
+ */
+function hasRedirect(command: string): boolean {
+	const roles = scanShellText(command);
+	for (let i = 0; i < command.length; i++) {
+		if (roles[i] !== "unquoted") continue;
+		const ch = command[i];
+		if (ch === ">") {
+			if (isFdToFdRedirect(command, i)) continue;
+			return true;
+		}
+		if (ch === "<" && (command[i + 1] === "<" || command[i + 1] === "(")) return true;
+	}
+	return false;
+}
+
+/** `2>&1` moves a file descriptor and writes nothing; every other `>` writes. */
+function isFdToFdRedirect(command: string, index: number): boolean {
+	return (
+		/[012]/.test(command[index - 1] ?? "") &&
+		command[index + 1] === "&" &&
+		/[012]/.test(command[index + 2] ?? "")
+	);
+}
+
 function judgeSafeCommand(command: string) {
-	// Treat newlines as command separators so a second line cannot smuggle a
-	// mutating command past the per-segment allowlist check.
-	const singleLine = command.replace(/\n+/g, "; ");
+	// A backslash-newline is a line continuation: bash removes both characters before
+	// it reads the line, so `sort -\⏎o OUT f` reaches sort as `sort -o OUT f`. Removing
+	// the pair first keeps the splitter from reading the `;` inserted below as an
+	// escaped separator, which is how a spliced flag stayed invisible (the continuation
+	// branch in bashNormalized keeps its own handling of the same rule for direct
+	// calls and for the test that pins the second reading).
+	const singleLine = command.replace(/\\\n/g, "").replace(/\n+/g, "; ");
 
-	// Strip quoted strings: words inside quotes are search patterns or text, not
-	// commands to execute ("grep -rn 'rm -rf' ." must be allowed).
-	const unquoted = singleLine.replace(/"[^"]*"|'[^']*'/g, " ");
-
-	// Command substitution expands inside double quotes and unquoted, but not
-	// inside single quotes — so strip only single-quoted strings for this check.
-	const noSingleQuotes = singleLine.replace(/'[^']*'/g, " ");
-	if (/\$\(|`/.test(noSingleQuotes)) return false;
+	// Expansion is refused instead of modelled, and the check reads quote roles rather
+	// than stripping quotes with a pattern: `echo \'$(x)\'` and `echo "' $(x) '"`
+	// reach bash as a command substitution (the first quote is escaped, the second
+	// sits inside a double-quoted string), while `sed -n '$p' f`, `grep -rn '$' .` and
+	// `echo \$HOME` stay literal.
+	if (hasExpansion(singleLine)) return false;
 
 	// Redirects write files; block every unquoted one except harmless fd-to-fd
 	// forms like 2>&1 ("grep foo 2>&1 | head" is read-only). Heredocs (<<, <<<)
-	// and process substitution (<(...)) are blocked because their bodies can
-	// smuggle arbitrary commands.
-	const noFdRedirs = unquoted.replace(/\b[012]>&[012]\b/g, "");
-	if (/(^|[^<])>(?!>)|>>|<<|<\s*\(/.test(noFdRedirs)) return false;
+	// and process substitution (<(...), >(...)) are blocked because their bodies can
+	// smuggle arbitrary commands, and a redirect is only one the shell would act on:
+	// quoting or escaping the `>` makes it an argument (`cat f \" > OUT \"` writes
+	// OUT in bash, `echo a \> b` prints it).
+	if (hasRedirect(singleLine)) return false;
 
 	// `git log --output=x` writes x (same for `git diff`/`git show`), and no
 	// read-only command in the allowlist takes an output-file flag. Unlike the
@@ -1475,12 +1574,12 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 	// Parameter expansion defeats both readings: `sort${IFS}-o OUT f` is one word to
 	// the judge and two words to bash, so no flag check ever sees the `-o`, and
 	// `echo $(git tag -d v2)` runs a command whose text the allowlist never reads.
-	// Modelling expansion would be one more parser to get wrong, so a `$` or a
-	// backtick outside single quotes is refused instead. Single quotes are literal in
-	// bash, which keeps `sed -n '$p' f` and `grep -rn '$' .` allowed; the price is a
-	// false denial for a double-quoted `$` (`grep -rn "$x" .`) and for `$'…'`, both of
-	// which were refused through other paths before this check existed.
-	if (reading === "raw" && /\$|`/.test(segment.replace(/'[^']*'/g, " "))) return false;
+	// A `$` the shell would expand is therefore refused instead: outside single quotes
+	// and not backslash-escaped, which keeps `sed -n '$p' f`, `grep -rn '$' .` and
+	// `echo \$HOME` allowed. The price is a false denial for a double-quoted `$`
+	// (`grep -rn "$x" .`) and for `$'…'`, both of which were refused through other
+	// paths before this check existed.
+	if (reading === "raw" && hasExpansion(segment)) return false;
 	if (!SAFE_BASH_PATTERNS.some((pattern) => pattern.test(segment))) return false;
 
 	const head = firstCommandWord(segment);
@@ -1744,7 +1843,10 @@ function decodeAnsiCString(command: string, start: number): [string, number] {
 // matched by prefix (see hasDangerousLongOption), so it covers the abbreviated
 // spellings these parsers accept as well as the full ones.
 const SORT_WRITE_OPTIONS = ["--output", "--compress-program", "--temporary-directory"];
-const RG_EXEC_OPTIONS = ["--pre", "--pre-glob"];
+// ripgrep runs a program for `--pre`/`--pre-glob`, and `--hostname-bin` names the
+// program it runs to resolve the hostname it prints in its header. `--pager` is not a
+// ripgrep flag (checked against `rg --help`), so it is not listed.
+const RG_EXEC_OPTIONS = ["--pre", "--pre-glob", "--hostname-bin"];
 const FD_EXEC_OPTIONS = ["--exec", "--exec-batch"];
 const TREE_WRITE_OPTIONS = ["--output"];
 const DATE_SET_OPTIONS = ["--set"];
@@ -1988,66 +2090,49 @@ function isAllowedPowerShellHead(head: string, segment: string): boolean {
 
 // Splits a command on unquoted separators (`;`, `&`, `&&`, `||`, `|`, `|&`), so
 // quoted search patterns like "a;b" or "x | y" do not produce phantom segments and a
-// quoted `;` is data rather than a boundary. Backslash escapes are honoured while
-// splitting: an escaped quote is a literal character, not the start of a quoted
-// region (`echo \" ; git tag -d v2` is two commands), and an escaped separator keeps
-// that character inside its segment (`echo a \; b` is one command).
+// quoted `;` is data rather than a boundary. The quote-and-escape roles come from
+// scanShellText — the same model the expansion and redirect checks read — so an escaped
+// quote is a literal character rather than the start of a quoted region
+// (`echo \" ; git tag -d v2` is two commands) and an escaped separator stays inside its
+// segment (`echo a \; b` is one command).
 function splitShellSegments(command: string): string[] {
+	const roles = scanShellText(command);
 	const segments: string[] = [];
 	let current = "";
-	let quote: string | undefined;
+	const live = (index: number) => roles[index] === "unquoted";
 	for (let i = 0; i < command.length; i++) {
 		const ch = command[i];
-		if (quote) {
-			current += ch;
-			// Only inside double quotes does a backslash escape the next character, so
-			// `\"` stays inside the string and `\\` does not escape the closing quote.
-			// Single quotes are literal throughout: nothing closes them but a quote.
-			if (ch === "\\" && quote === '"') {
-				const escaped = command[i + 1];
-				if (escaped !== undefined) {
-					current += escaped;
-					i++;
-				}
+		if (live(i)) {
+			const next = command[i + 1];
+			// `|` and `|&` separate pipeline stages, `&&`/`||` separate and-or lists, and a
+			// bare `&` backgrounds the command — the following command runs too and has to
+			// be judged on its own. `>&` and `&>` are redirects (already refused below), not
+			// separators.
+			if (ch === "|") {
+				segments.push(current);
+				current = "";
+				if (live(i + 1) && (next === "|" || next === "&")) i++;
 				continue;
 			}
-			if (ch === quote) quote = undefined;
-			continue;
-		}
-		// Unquoted, a backslash escapes the next character. Skipping the pair keeps the
-		// quote state honest and keeps an escaped separator out of the split.
-		if (ch === "\\") {
-			const escaped = command[i + 1];
-			current += escaped === undefined ? ch : ch + escaped;
-			i++;
-			continue;
-		}
-		if (ch === '"' || ch === "'") {
-			quote = ch;
-			current += ch;
-			continue;
-		}
-		// `|` and `|&` separate pipeline stages, `&&`/`||` separate and-or lists, and a
-		// bare `&` backgrounds the command — the following command runs too and has to
-		// be judged on its own. `>&` and `&>` are redirects (already refused below), not
-		// separators.
-		const next = command[i + 1];
-		if (ch === "|") {
-			segments.push(current);
-			current = "";
-			if (next === "|" || next === "&") i++;
-			continue;
-		}
-		if (ch === ";" || (ch === "&" && next !== "&" && next !== ">" && command[i - 1] !== ">")) {
-			segments.push(current);
-			current = "";
-			continue;
-		}
-		if (ch === "&" && next === "&") {
-			segments.push(current);
-			current = "";
-			i++;
-			continue;
+			if (ch === ";") {
+				segments.push(current);
+				current = "";
+				continue;
+			}
+			if (ch === "&") {
+				if (live(i + 1) && next === "&") {
+					segments.push(current);
+					current = "";
+					i++;
+					continue;
+				}
+				const redirect = (live(i + 1) && next === ">") || (live(i - 1) && command[i - 1] === ">");
+				if (!redirect) {
+					segments.push(current);
+					current = "";
+					continue;
+				}
+			}
 		}
 		current += ch;
 	}
