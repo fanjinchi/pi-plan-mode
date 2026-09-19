@@ -1507,7 +1507,19 @@ function judgeSafeCommand(command: string) {
 	// escaped separator, which is how a spliced flag stayed invisible (the continuation
 	// branch in bashNormalized keeps its own handling of the same rule for direct
 	// calls and for the test that pins the second reading).
-	const singleLine = command.replace(/\\\n/g, "").replace(/\n+/g, "; ");
+	// A backslash-newline is a continuation only when that backslash is not itself
+	// escaped: for a run of N backslashes the shell drops the last one together with the
+	// newline when N is odd, and keeps the newline as a real separator when N is even
+	// (`echo \\` followed by a newline starts a second command). Deleting `\`+newline
+	// everywhere joined those two commands into one for even runs, so the join counts the
+	// run: the surviving backslashes stay even, which is what keeps the inserted
+	// separator unescaped.
+	const singleLine = command
+		.replace(/(\\+)\n/g, (run) => {
+			const backslashes = run.length - 1;
+			return backslashes % 2 === 1 ? run.slice(0, -2) : run.slice(0, -1) + "; ";
+		})
+		.replace(/\n+/g, "; ");
 
 	// Expansion is refused instead of modelled, and the check reads quote roles rather
 	// than stripping quotes with a pattern: `echo \'$(x)\'` and `echo "' $(x) '"`

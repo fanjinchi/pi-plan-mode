@@ -1235,6 +1235,38 @@ test("isSafeCommand judges continuations and quote roles the way bash does", () 
 	assert.equal(isSafeCommand("rg -n a f"), true);
 });
 
+test("isSafeCommand counts backslash runs before a newline the way bash does", () => {
+	// An even run of backslashes leaves the newline as a real separator: the last
+	// backslash escapes its neighbour instead of the newline, so the shell runs two
+	// commands. Measured in bash, the canary runs and `git tag -d v2` deletes the tag;
+	// a join that deleted every backslash-newline read those as one command.
+	assert.equal(isSafeCommand("echo \\\\\ncanaryprogram"), false);
+	assert.equal(isSafeCommand("echo \\\\\ngit tag -d v2"), false);
+	assert.equal(isSafeCommand("ls \\\\\ncanaryprogram"), false);
+	assert.equal(isSafeCommand("ls \\\\\\\\\ncanaryprogram"), false);
+	assert.equal(isSafeCommand("ls \\\\\\\\\\\\\ncanaryprogram"), false);
+	// An even run inside single quotes is literal text, but the separator that follows
+	// it is real, so the program behind it is still judged.
+	assert.equal(isSafeCommand('echo "a\\\\\n" ; canaryprogram'), false);
+	assert.equal(isSafeCommand("echo 'a\\\\\nb' ; canaryprogram"), false);
+
+	// An odd run is a continuation: the shell joins the lines, so the joined text is
+	// what reaches the command. A flag spelled across the join is refused, and a
+	// benign read-only join stays allowed — both directions pin the parity.
+	assert.equal(isSafeCommand("sort -\\\no OUT f"), false);
+	assert.equal(isSafeCommand("git log --outp\\\nut=OUT -1"), false);
+	assert.equal(isSafeCommand("find . -\\\nexec canaryprogram {} +"), false);
+	assert.equal(isSafeCommand("git log --format=%s -\\\n1"), true);
+	assert.equal(isSafeCommand("find src -name '*.ts' -\\\nprint"), true);
+
+	// The plain non-continuation positives keep working.
+	assert.equal(isSafeCommand("echo a \\; git tag -d v2"), true);
+	assert.equal(isSafeCommand("cat f \\; b"), true);
+	assert.equal(isSafeCommand("echo 'a; b'"), true);
+	assert.equal(isSafeCommand("sed -n '$p' f"), true);
+	assert.equal(isSafeCommand("cat f || cat g"), true);
+});
+
 test("normalizePlanModeQuestionParams validates question shape", () => {
 	const result = normalizePlanModeQuestionParams({
 		questions: [
