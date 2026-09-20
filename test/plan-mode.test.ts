@@ -1291,6 +1291,12 @@ test("a shell comment ends at the newline and never swallows the next command", 
 	// segment to judge. That is a refusal in the safe direction (bash runs nothing) and
 	// deliberately stays a refusal.
 	assert.equal(isSafeCommand("# canaryprogram"), false);
+	// A `#` is data when it sits inside quotes or behind a backslash, so the command
+	// after the separator has to stay visible: bash deletes the tag and runs the canary
+	// in these rows, and a judge that lost the `;` would allow one read-only segment.
+	assert.equal(isSafeCommand("echo 'a # b' ; git tag -d v2"), false);
+	assert.equal(isSafeCommand(`echo \\# ; canaryprogram`), false);
+	assert.equal(isSafeCommand(`git log -1 \\# ; git tag -d v2`), false);
 
 	// The read-only side of the same rule stays enabled: `#` mid-word, quoted, escaped,
 	// at the start of a following line, or after a separator is not a comment, and a

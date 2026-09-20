@@ -1509,10 +1509,10 @@ function isFdToFdRedirect(command: string, index: number): boolean {
  * separator during the role scan, hiding the command from the judge. Comment
  * text is therefore removed before the join; quote state is carried across
  * physical lines so a `#` inside quotes stays literal, and a backslash run
- * before the newline is left in place for the join's parity rule. The price is a
- * refusal in the safe direction: a continuation joined *into* a comment line
- * (`echo a \` followed by `# x`) keeps the comment text and judges those words
- * as part of the command.
+ * before the newline is left in place for the join's parity rule. A continuation
+ * joined into a comment line (`echo a \` followed by `# x`) drops the comment text
+ * and judges what is left (`echo a`), which is read-only and stays allowed — bash
+ * prints `a` there too, so nothing is refused by that path.
  */
 function stripShellComments(command: string) {
 	let stripped = "";
