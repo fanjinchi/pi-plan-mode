@@ -7,6 +7,7 @@ import planMode, {
 	bashNormalized,
 	canSelectToolInPlanMode,
 	completePlanArguments,
+	hasUnquotedSeparator,
 	isContextManagementTool,
 	isDefaultPlanModeTool,
 	isPlanFileTarget,
@@ -1074,6 +1075,90 @@ test("isSafeCommand allows read-only searches whose patterns mention mutating wo
 	assert.equal(isSafeCommand("cd ~/.pi/agent/skills && grep -rn context ."), true);
 	assert.equal(isSafeCommand("find . -name rm"), true);
 	assert.equal(isSafeCommand('echo "a;b"'), true);
+});
+
+test("isSafeCommand reads program names in command position only", () => {
+	// A word that names an editor, a shell, or a process tool is a program only when it
+	// is the command word. Everywhere else it is text: a path, a printed string, or a
+	// search pattern. Projects that live under a `code` directory made every
+	// `cd <dir> && grep …` line unusable while those words were scanned as segment text.
+	assert.equal(isSafeCommand("cd /home/u/code && grep -rn x ."), true);
+	assert.equal(isSafeCommand("cd ~/code && ls"), true);
+	assert.equal(isSafeCommand("echo /home/u/code"), true);
+	assert.equal(isSafeCommand("test -d /home/u/code && echo yes"), true);
+	assert.equal(isSafeCommand("cd /home/u/bash-notes && ls"), true);
+	assert.equal(isSafeCommand("cd /home/u/vim-config && ls"), true);
+	assert.equal(isSafeCommand("cd /srv/su-data && ls"), true);
+	assert.equal(isSafeCommand("echo vim f"), true);
+	assert.equal(isSafeCommand("grep -rn code /home/u/code"), true);
+
+	// The same words still name a program in command position, so every refusal that
+	// existed before this rule stays a refusal — a second command after a separator is
+	// judged on its own part, and the guards for find/sort/rg/sed/git/uniq/fd are
+	// untouched by this change.
+	for (const command of [
+		"code .",
+		"vim f",
+		"nano f",
+		"emacs f",
+		"subl f",
+		"bash script.sh",
+		"bash -c 'rm -rf /'",
+		"zsh -c 'x'",
+		"fish f",
+		"sudo rm -rf /",
+		"sudo -n true",
+		"kill 1",
+		"pkill node",
+		"killall node",
+		"reboot",
+		"shutdown -h now",
+		"systemctl restart x",
+		"service nginx restart",
+		"cat f && vim x",
+		"cd /tmp && vim f",
+		"find . -exec rm {} +",
+		"sort -o OUT f",
+		"rg --pre x f",
+		"npm audit fix",
+		"sed -i '' 's/a/b/' f",
+		"git tag -d v2",
+		"uniq f OUT",
+		"fd -x rm",
+	]) {
+		assert.equal(isSafeCommand(command), false, `must stay refused: ${command}`);
+	}
+
+	// The entries that were not about a program name stay exactly as conservative as
+	// they were: `rm`-style words are still scanned in argument text, so a path that
+	// contains one is refused (a deliberate false denial), and a search for a mutating
+	// phrase is still blocked by the phrase entries.
+	assert.equal(isSafeCommand("cd /home/u/rm-stuff && ls"), false);
+	assert.equal(isSafeCommand("git log --grep='npm install' -5"), false);
+});
+
+test("hasUnquotedSeparator refuses only a separator that survived the split", () => {
+	const nl = "\n";
+	// The splitter turns every live `;`, `&`, `|`, `|&`, `&&`, `||`, and newline into a
+	// part boundary, so a separator still inside a part is the invariant that keeps the
+	// shell and the judge from disagreeing about where a command ends.
+	assert.equal(hasUnquotedSeparator("cat f ; git tag -d v2"), true);
+	assert.equal(hasUnquotedSeparator("cat f && vim x"), true);
+	assert.equal(hasUnquotedSeparator("cat f | sh"), true);
+	assert.equal(hasUnquotedSeparator("cat f |& sh"), true);
+	assert.equal(hasUnquotedSeparator("cat f & vim x"), true);
+	assert.equal(hasUnquotedSeparator(`cat f${nl}vim x`), true);
+	// Quoted, escaped, and fd-to-fd forms are data rather than boundaries.
+	assert.equal(hasUnquotedSeparator("cat 'a; b'"), false);
+	assert.equal(hasUnquotedSeparator('cat "a | b"'), false);
+	assert.equal(hasUnquotedSeparator("cat f \\; b"), false);
+	assert.equal(hasUnquotedSeparator("cat f \\& b"), false);
+	assert.equal(hasUnquotedSeparator("grep foo 2>&1"), false);
+	// The commands the judge sees keep working end to end.
+	assert.equal(isSafeCommand("grep foo ~/.pi 2>&1 | head -20"), true);
+	assert.equal(isSafeCommand("cat f 2>&1"), true);
+	assert.equal(isSafeCommand("echo 'a; b' ; sort -n f"), true);
+	assert.equal(isSafeCommand("echo a \\; git tag -d v2"), true);
 });
 
 test("isSafeCommand blocks mutations hiding in pipes, redirects, and find flags", () => {

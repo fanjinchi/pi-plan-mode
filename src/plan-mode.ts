@@ -248,13 +248,47 @@ const MUTATING_BASH_PATTERNS = [
 	// below (`git stash list`, `git tag -l`), and those patterns pin the listing
 	// verb, so the mutating subcommands already fail the allowlist first.
 	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|switch|cherry-pick|revert|init|clone)\b/i,
-	/\b(sudo|su|kill|pkill|killall|reboot|shutdown)\b/i,
-	/\b(?:bash|zsh|fish|ksh|dash|csh|tcsh|pwsh)\b/i,
 	/\bsystem\s*\(/i,
-	/\bsystemctl\s+(start|stop|restart|enable|disable)\b/i,
-	/\bservice\s+\S+\s+(start|stop|restart)\b/i,
-	/\b(vim?|nano|emacs|code|subl)\b/i,
 ];
+
+// Programs this judge never treats as read-only, whatever their arguments: editors
+// and IDE launchers that can start a shell or write a file, shells and interpreters, and
+// the privilege and process tools. These used to be text patterns inside
+// MUTATING_BASH_PATTERNS, which scans the whole segment with quotes intact, so the
+// words fired on *arguments*: a project under `~/code` was refused for naming the
+// editor `code` (`cd ~/code && grep -rn x .`), and `cd /srv/su-data` was refused for
+// `su`. The match is now against the command word — the same firstCommandWord() the
+// head guards below use, on the raw reading and again on the normalized one — so
+// `echo vim f` prints the word while `vim f` stays refused. Every SAFE_BASH_PATTERNS
+// entry is anchored on a specific read-only head, so a segment headed by one of
+// these programs fails the allowlist before this set is consulted; the set is kept
+// as defense in depth, so the refusal does not depend on the allowlist staying
+// exactly as strict as it is today.
+const FORBIDDEN_PROGRAM_HEADS: ReadonlySet<string> = new Set([
+	"vi",
+	"vim",
+	"nano",
+	"emacs",
+	"code",
+	"subl",
+	"bash",
+	"zsh",
+	"fish",
+	"ksh",
+	"dash",
+	"csh",
+	"tcsh",
+	"pwsh",
+	"sudo",
+	"su",
+	"kill",
+	"pkill",
+	"killall",
+	"reboot",
+	"shutdown",
+	"systemctl",
+	"service",
+]);
 
 const SAFE_BASH_PATTERNS = [
 	// `awk` is absent on purpose: it is an interpreter, and a keyword scan cannot
@@ -1623,6 +1657,9 @@ function judgeSafeCommand(command: string) {
 	if (segments.length === 0) return false;
 
 	for (const segment of segments) {
+		// A separator that survived the split is a second command this judge never reads,
+		// so every part must be separator-free (see hasUnquotedSeparator).
+		if (hasUnquotedSeparator(segment)) return false;
 		if (!judgeSegment(segment, "raw")) return false;
 		// The same decision is made again on the bash-normalized reading of the segment.
 		// Escaping cannot create a separator (a quoted `;` reaches the program as an
@@ -1664,6 +1701,12 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 
 	const head = firstCommandWord(segment);
 	if (!head) return true;
+
+	// A program that is never read-only is refused by its command word, not by
+	// scanning the segment text, so an argument or a path that contains one of those
+	// words stays readable (`cd ~/code && grep -rn x .` is a search, not an editor
+	// launch). See FORBIDDEN_PROGRAM_HEADS for why this is still a refusal at all.
+	if (FORBIDDEN_PROGRAM_HEADS.has(head)) return false;
 
 	// `git log --output=x` writes x (same for `git diff`/`git show`), and no
 	// read-only command in the allowlist takes an output-file flag. A quote may sit
@@ -1786,7 +1829,10 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 
 	// Non-pure-read heads (echo, printf, git, npm, env, ...) are checked against
 	// the mutating keywords on the full segment text (quotes intact) — e.g.
-	// `git log --grep='npm install' -5` stays blocked.
+	// `git log --grep='npm install' -5` stays blocked. The program-name words
+	// (editors, shells, privilege and process tools) used to be matched here as well;
+	// they are now matched against the command word instead (FORBIDDEN_PROGRAM_HEADS),
+	// so a path or a pattern that contains one is not a reason to refuse.
 	const segmentNoFdRedirs = segment.replace(/\b[012]>&[012]\b/g, "");
 	if (MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(segmentNoFdRedirs))) return false;
 
@@ -2224,6 +2270,30 @@ function splitShellSegments(command: string): string[] {
 	// An empty segment carries no command (`echo hi;`, `a || b` after the operator was
 	// consumed), so it is not a boundary anyone can hide behind.
 	return segments.filter((segment) => segment.trim() !== "");
+}
+
+/**
+ * True when a part still carries a separator the splitter did not take out. Every
+ * `;`, `&`, `|`, or newline the judge reaches has already become a boundary, so a
+ * separator left inside a part means the splitter and the shell disagree about where
+ * a command ends — exactly the failure mode that would let a second command ride
+ * along inside a part judged as read-only. The roles come from the same scanShellText
+ * model the splitter reads, so an escaped separator (`cat f \; b`), a quoted one
+ * (`echo 'a; b'`), and the `&` of an fd-to-fd redirect (`grep foo 2>&1 | head`) stay
+ * data here as they do there; `>&` and `&>` never reach this check, because the
+ * redirect check refuses those commands first. Through today's splitter the condition
+ * is unreachable by construction: the check is kept as the invariant that catches a
+ * future splitter change instead of letting it hand the judge a hidden command.
+ */
+export function hasUnquotedSeparator(segment: string): boolean {
+	const roles = scanShellText(segment);
+	for (let i = 0; i < segment.length; i++) {
+		if (roles[i] !== "unquoted") continue;
+		const char = segment[i];
+		if (char === "&" && isFdToFdRedirect(segment, i - 1)) continue;
+		if (char === ";" || char === "|" || char === "&" || char === "\n") return true;
+	}
+	return false;
 }
 
 // True when the segment's first token carries a path separator. Such a token is
