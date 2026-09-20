@@ -218,20 +218,17 @@ const PLAN_MODE_QUESTION_PARAMS = {
 	},
 } as const;
 
+// Text patterns for mutations that reach the judge with no command word to attribute
+// to them: a write handle (`>`/`>>`), a package-manager or git phrase whose report form
+// is allowlisted, or a call in script text (`system(`). The 13 file-mutating program
+// words (`rm`, `rmdir`, `mv`, `cp`, `mkdir`, `touch`, `chmod`, `chown`, `chgrp`, `ln`,
+// `tee`, `truncate`, `dd`) were removed from this scan: each names a program only as
+// the command word, and every mutation they name is refused without the scan — by the
+// allowlist (they have no entry at all), by a head guard (find, sed, sort, rg, fd,
+// tree, date, bat, git), or by a named flag family. Scanning argument text refused
+// paths, patterns, and printed words instead (`cd /home/u/rm-stuff && ls`,
+// `git log --grep=rm`), so the double-check bought nothing and cost real refusals.
 const MUTATING_BASH_PATTERNS = [
-	/\brm\b/i,
-	/\brmdir\b/i,
-	/\bmv\b/i,
-	/\bcp\b/i,
-	/\bmkdir\b/i,
-	/\btouch\b/i,
-	/\bchmod\b/i,
-	/\bchown\b/i,
-	/\bchgrp\b/i,
-	/\bln\b/i,
-	/\btee\b/i,
-	/\btruncate\b/i,
-	/\bdd\b/i,
 	/(^|[^<])>(?!>)/,
 	/>>/,
 	/\bnpm\s+(install|uninstall|update|ci|link|publish|version)\b/i,
@@ -1827,12 +1824,18 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 
 	if (PURE_READ_BASH_COMMANDS.has(head)) return true;
 
-	// Non-pure-read heads (echo, printf, git, npm, env, ...) are checked against
-	// the mutating keywords on the full segment text (quotes intact) — e.g.
-	// `git log --grep='npm install' -5` stays blocked. The program-name words
-	// (editors, shells, privilege and process tools) used to be matched here as well;
-	// they are now matched against the command word instead (FORBIDDEN_PROGRAM_HEADS),
-	// so a path or a pattern that contains one is not a reason to refuse.
+	// Non-pure-read heads (echo, printf, git, npm, env, ...) are checked against the
+	// text patterns above on the full segment text (quotes intact) — e.g.
+	// `git log --grep='npm install' -5` stays blocked by the dependency phrase. The
+	// words that name a program (editors, shells, privilege and process tools, and the
+	// file-mutating commands) are not matched here any more: the first group is
+	// FORBIDDEN_PROGRAM_HEADS, and the second has no allowlist entry to reach this
+	// point, so a path, a pattern, or a printed word that contains one is not a reason
+	// to refuse. That leaves argument text unscanned for those words, which is why an
+	// allowlisted head that can execute a verbatim argument needs its own guard (find
+	// `-exec`/`-delete`, sed's script grammar, `sort -o`/`-T`, `uniq INPUT OUTPUT`, the
+	// git and package-manager phrase entries): keep that requirement when you add an
+	// allowlist entry.
 	const segmentNoFdRedirs = segment.replace(/\b[012]>&[012]\b/g, "");
 	if (MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(segmentNoFdRedirs))) return false;
 

@@ -1129,12 +1129,75 @@ test("isSafeCommand reads program names in command position only", () => {
 		assert.equal(isSafeCommand(command), false, `must stay refused: ${command}`);
 	}
 
-	// The entries that were not about a program name stay exactly as conservative as
-	// they were: `rm`-style words are still scanned in argument text, so a path that
-	// contains one is refused (a deliberate false denial), and a search for a mutating
-	// phrase is still blocked by the phrase entries.
-	assert.equal(isSafeCommand("cd /home/u/rm-stuff && ls"), false);
+	// Argument text is not keyword-scanned for the file-mutating words any more either
+	// (see the next test), while a search for a mutating *phrase* stays blocked by the
+	// phrase entries.
+	assert.equal(isSafeCommand("cd /home/u/rm-stuff && ls"), true);
 	assert.equal(isSafeCommand("git log --grep='npm install' -5"), false);
+});
+
+test("isSafeCommand leaves argument text unscanned and keeps every sink guarded", () => {
+	// The 13 file-mutating program names (`rm`, `rmdir`, `mv`, `cp`, `mkdir`, `touch`,
+	// `chmod`, `chown`, `chgrp`, `ln`, `tee`, `truncate`, `dd`) were matched against the
+	// whole segment text, so a path, a search pattern, or a printed word that contained
+	// one was refused. Each of them stays refused without that scan — the allowlist has
+	// no entry for the program itself, or the read-only head that can execute one has
+	// its own guard — so the scan was removed and these read-only forms are readable.
+	for (const command of [
+		"git log --grep=rm",
+		"git log --grep=mkdir",
+		"git show --grep=mv",
+		"git diff --stat -- mv.txt",
+		"git status --short -- rm.txt",
+		"git log --author=rm",
+		"git ls-files rm.txt",
+		"git grep rm",
+		'date --date="+1 rm"',
+		"echo rm",
+		'echo "cp -r"',
+		"echo rmdir && echo tee",
+		"printf 'rm %s' x",
+		"npm view rm",
+		"npm list rm --json",
+		"sed -n '1p' rm.txt",
+		"test -f rm.txt",
+		"printenv rm",
+		"node --version rm",
+		"cd /srv/rm-data && ls",
+		"cd /home/u/mv-data && ls",
+	]) {
+		assert.equal(isSafeCommand(command), true, `must be readable: ${command}`);
+	}
+
+	// Every sink that can still run one of those words behind an allowlisted head keeps
+	// its own guard: the words as command words, the git and package-manager verbs that
+	// reach a mutation without one, the find and xargs forms, and the named flag families.
+	for (const command of [
+		"rm f",
+		"rm -rf /",
+		"mkdir d",
+		"truncate -s 0 f",
+		"dd of=f",
+		"git rm -r x",
+		"git rm --cached x",
+		"git mv a b",
+		"npm rm x",
+		"npm uninstall x",
+		"npm install x",
+		"find . -exec rm {} +",
+		"find . -execdir rm {} +",
+		"xargs rm",
+		"ls | xargs rm",
+		"env rm x",
+		"sh -c 'rm x'",
+		"echo hi ; rm x",
+		"echo hi > out",
+		"git log --output=x",
+		"sed -i 's/a/b/' f",
+		"sort -o out f",
+	]) {
+		assert.equal(isSafeCommand(command), false, `must stay refused: ${command}`);
+	}
 });
 
 test("hasUnquotedSeparator refuses only a separator that survived the split", () => {
