@@ -1267,6 +1267,51 @@ test("isSafeCommand counts backslash runs before a newline the way bash does", (
 	assert.equal(isSafeCommand("cat f || cat g"), true);
 });
 
+test("a shell comment ends at the newline and never swallows the next command", () => {
+	const nl = "\n";
+	// `#` starts a comment at the beginning of a word outside quotes, and bash ends
+	// that comment at the physical newline no matter how many backslashes sit in front
+	// of it: the next line is a fresh command. Measured in bash, these forms run the
+	// canary or delete tag v2, so the judge has to refuse them (before comments were
+	// stripped, an apostrophe in the comment text also swallowed the separator the join
+	// inserts and the whole text was judged as one read-only command).
+	assert.equal(isSafeCommand(`echo hi # x\\${nl}canaryprogram`), false);
+	assert.equal(isSafeCommand(`echo hi # x\\\\${nl}canaryprogram`), false);
+	assert.equal(isSafeCommand(`echo hi # x${nl}canaryprogram`), false);
+	assert.equal(isSafeCommand(`git log -1 # x\\${nl}git tag -d v2`), false);
+	assert.equal(isSafeCommand(`git log -1 # x${nl}git tag -d v2`), false);
+	assert.equal(isSafeCommand(`cat f # '${nl}canaryprogram`), false);
+	assert.equal(isSafeCommand(`cat f # "${nl}canaryprogram`), false);
+	assert.equal(isSafeCommand(`cat f # '\\${nl}canaryprogram`), false);
+	assert.equal(isSafeCommand(`echo hi # it's fine\\\\${nl}canaryprogram`), false);
+	// A `#` inside a word is literal text rather than a comment, so what follows it on
+	// the same line is still judged (bash runs the tag deletion here).
+	assert.equal(isSafeCommand("echo a#b ; git tag -d v2"), false);
+	// A command that is only a comment is refused — the stripped text leaves no
+	// segment to judge. That is a refusal in the safe direction (bash runs nothing) and
+	// deliberately stays a refusal.
+	assert.equal(isSafeCommand("# canaryprogram"), false);
+
+	// The read-only side of the same rule stays enabled: `#` mid-word, quoted, escaped,
+	// at the start of a following line, or after a separator is not a comment, and a
+	// comment line before a read-only command is fine.
+	assert.equal(isSafeCommand("echo a#b"), true);
+	assert.equal(isSafeCommand("echo '#'"), true);
+	assert.equal(isSafeCommand('echo "#"'), true);
+	assert.equal(isSafeCommand("cat f # comment"), true);
+	assert.equal(isSafeCommand("echo a # b"), true);
+	assert.equal(isSafeCommand(`# comment${nl}cat f`), true);
+	assert.equal(isSafeCommand(`echo \\#`), true);
+	assert.equal(isSafeCommand(`cat f ; # c${nl}git log -1`), true);
+	assert.equal(isSafeCommand("echo a # b ; # c"), true);
+	// A `#` inside a quoted string is literal, even when the quote spans lines.
+	assert.equal(isSafeCommand(`echo 'hi # x\\${nl}canaryprogram'`), true);
+	// A continuation that lands on a comment line drops the comment text and judges
+	// what is left, which is read-only either way (`echo`, and `echo \`).
+	assert.equal(isSafeCommand(`echo \\${nl}# x`), true);
+	assert.equal(isSafeCommand(`echo \\\\${nl}# canaryprogram`), true);
+});
+
 test("normalizePlanModeQuestionParams validates question shape", () => {
 	const result = normalizePlanModeQuestionParams({
 		questions: [

@@ -1500,6 +1500,74 @@ function isFdToFdRedirect(command: string, index: number): boolean {
 	);
 }
 
+/**
+ * Bash drops a `#` comment (outside quotes, at the start of a word) up to the
+ * physical newline, and a backslash inside the comment does not continue it:
+ * `cat f # '` followed by a newline runs the next line as a fresh command. The
+ * join below would glue that comment text onto the next command, and an
+ * apostrophe or double quote inside the comment then swallows the inserted
+ * separator during the role scan, hiding the command from the judge. Comment
+ * text is therefore removed before the join; quote state is carried across
+ * physical lines so a `#` inside quotes stays literal, and a backslash run
+ * before the newline is left in place for the join's parity rule. The price is a
+ * refusal in the safe direction: a continuation joined *into* a comment line
+ * (`echo a \` followed by `# x`) keeps the comment text and judges those words
+ * as part of the command.
+ */
+function stripShellComments(command: string) {
+	let stripped = "";
+	let quote: "'" | '"' | null = null;
+	let atWordStart = true;
+	let inComment = false;
+	for (let index = 0; index < command.length; index += 1) {
+		const char = command[index] ?? "";
+		if (inComment) {
+			if (char === "\n") {
+				inComment = false;
+				atWordStart = true;
+				stripped += char;
+			}
+			continue;
+		}
+		if (quote === "'") {
+			stripped += char;
+			if (char === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			stripped += char;
+			if (char === "\\") {
+				index += 1;
+				stripped += command[index] ?? "";
+			} else if (char === '"') {
+				quote = null;
+			}
+			continue;
+		}
+		if (char === "#" && atWordStart) {
+			inComment = true;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			quote = char;
+			atWordStart = false;
+			stripped += char;
+			continue;
+		}
+		if (char === "\\") {
+			stripped += char;
+			index += 1;
+			const escaped = command[index] ?? "";
+			stripped += escaped;
+			if (escaped !== "\n") atWordStart = false;
+			continue;
+		}
+		stripped += char;
+		atWordStart = char === " " || char === "\t" || char === "\n" || ";|&()<>".includes(char);
+	}
+	return stripped;
+}
+
 function judgeSafeCommand(command: string) {
 	// A backslash-newline is a line continuation: bash removes both characters before
 	// it reads the line, so `sort -\⏎o OUT f` reaches sort as `sort -o OUT f`. Removing
@@ -1514,7 +1582,7 @@ function judgeSafeCommand(command: string) {
 	// everywhere joined those two commands into one for even runs, so the join counts the
 	// run: the surviving backslashes stay even, which is what keeps the inserted
 	// separator unescaped.
-	const singleLine = command
+	const singleLine = stripShellComments(command)
 		.replace(/(\\+)\n/g, (run) => {
 			const backslashes = run.length - 1;
 			return backslashes % 2 === 1 ? run.slice(0, -2) : run.slice(0, -1) + "; ";
@@ -1769,6 +1837,10 @@ export function bashNormalized(command: string): string {
 			const escaped = command[i + 1];
 			if (escaped === undefined) break;
 			// Backslash-newline is a line continuation: bash removes both characters.
+			// Production only feeds this function NL-free segments (`judgeSafeCommand`
+			// joins first), so this branch matters for direct calls; consuming the run
+			// pairwise keeps its parity right for raw text as well (an even run keeps a
+			// literal backslash and the newline, an odd one drops the escaped newline).
 			if (escaped !== "\n") out += escaped;
 			i += 2;
 			continue;
