@@ -602,6 +602,7 @@ test("the shared command judge refuses path-shaped heads and mutating git/sed fo
 			"uniq f",
 			"uniq -c f",
 			"uniq 'my file.txt'",
+			"uniq -- -a",
 			// `env` is refused while its read-only sibling stays available.
 			"printenv PATH",
 		]) {
@@ -868,8 +869,16 @@ test("isSafeCommand refuses exec-vector flags and the launchers that hide a head
 		"file --comp -m magic",
 		"file --co -m magic",
 		"file --C -m magic",
-		// `uniq INPUT OUTPUT` writes its second positional argument.
+		// `uniq INPUT OUTPUT` writes its second positional argument, and a `--` separator
+		// does not turn the output file into a flag: `uniq -- -a out.txt` writes out.txt
+		// when a file named `-a` exists, so the words behind the separator count as
+		// operands however they spell.
 		"uniq u.txt u.out",
+		"uniq -- -a out.txt",
+		"uniq --  -a out.txt",
+		"uniq -c -- -a out.txt",
+		"uniq -- -c f",
+		"uniq - -- a.txt out.txt",
 		// git's `-O` / `--open-files-in-pager` hands the output to a command.
 		"git log -O /tmp/order -1",
 		"git log -O/tmp/order -1",
@@ -923,6 +932,7 @@ test("isSafeCommand refuses exec-vector flags and the launchers that hide a head
 		"uniq f",
 		"uniq -c f",
 		"uniq 'my file.txt'",
+		"uniq -- -a",
 		"cat My\\ File.txt",
 		"more f",
 		"bat f",

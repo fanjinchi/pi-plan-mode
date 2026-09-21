@@ -1834,6 +1834,12 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 	// program out of a config file (`--config-file`).
 	if (head === "tree") {
 		if (hasDangerousShortFlag(segment, "o")) return false;
+		// `--o` folds onto `-o` above and `--out`/`--output` are refused by the
+		// head-agnostic `--ou…` clause earlier in this function, so every spelling
+		// tree has today is already refused without this line: it is belt-and-braces,
+		// kept for the output flag a later tree may grow. The mutation sweep therefore
+		// records retargeting TREE_WRITE_OPTIONS as an equivalent mutant, and guards
+		// the pair with a mutant that removes both lines.
 		if (hasDangerousLongOption(segment, TREE_WRITE_OPTIONS)) return false;
 	}
 	if (head === "date") {
@@ -1859,15 +1865,15 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 	}
 
 	// `uniq` takes its output file as a positional argument (`uniq INPUT OUTPUT`), so a
-	// second non-flag word is a write handle rather than a second input. Words are
-	// matched with quotes respected (`uniq "my file.txt"` is one argument), and only on
-	// the raw text: bash merges arguments when it quotes or escapes, never the other way
-	// around, so the raw word count can only over-count — and the normalized reading has
-	// already dropped the quotes, which would make one quoted filename look like two
-	// words and refuse a read.
+	// second operand is a write handle rather than a second input. Words are matched with
+	// quotes respected (`uniq "my file.txt"` is one argument), and only on the raw text:
+	// bash merges arguments when it quotes or escapes, never the other way around, so the
+	// raw word count can only over-count — and the normalized reading has already dropped
+	// the quotes, which would make one quoted filename look like two words and refuse a
+	// read.
 	if (head === "uniq" && reading === "raw") {
 		const words = segment.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
-		if (words.slice(1).filter((word) => !word.startsWith("-")).length > 1) return false;
+		if (countUniqOperands(words.slice(1)) > 1) return false;
 	}
 
 	// git reads a program out of configuration for a handful of flags: `--ext-diff`
@@ -2161,6 +2167,28 @@ function hasDangerousShortFlag(segment: string, letters: string): boolean {
 		.some((rawToken) =>
 			pattern.test(rawToken.replace(/^['"]+/, "").replace(/^--(?=[a-zA-Z]$)/, "-")),
 		);
+}
+
+/**
+ * Counts the operands `uniq` receives. A `--` separator ends the flag scan the way bash
+ * hands it over, so everything behind it is a file name: `uniq -- -a out.txt` writes
+ * out.txt when a file named `-a` exists, and the old count — which dropped every
+ * `-`-prefixed word — read that as one operand. A quoted or escaped `--` is still the
+ * separator, and a bare `-` stays an operand because it names stdin.
+ */
+function countUniqOperands(words: readonly string[]): number {
+	let operands = 0;
+	let afterSeparator = false;
+	for (const word of words) {
+		const effective = word.replace(/^["']|["']$/g, "").replace(/\\(.)/g, "$1");
+		if (!afterSeparator && effective === "--") {
+			afterSeparator = true;
+			continue;
+		}
+		if (!afterSeparator && effective.startsWith("-") && effective !== "-") continue;
+		operands++;
+	}
+	return operands;
 }
 
 // PowerShell needs its own dialect. The POSIX allowlist matches whole command
