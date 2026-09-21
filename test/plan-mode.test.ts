@@ -1129,11 +1129,11 @@ test("isSafeCommand reads program names in command position only", () => {
 		assert.equal(isSafeCommand(command), false, `must stay refused: ${command}`);
 	}
 
-	// Argument text is not keyword-scanned for the file-mutating words any more either
-	// (see the next test), while a search for a mutating *phrase* stays blocked by the
-	// phrase entries.
+	// Argument text is not keyword-scanned for the file-mutating words or for the
+	// package-manager phrases any more (see the two tests below): a search for a phrase
+	// is a search, not an install.
 	assert.equal(isSafeCommand("cd /home/u/rm-stuff && ls"), true);
-	assert.equal(isSafeCommand("git log --grep='npm install' -5"), false);
+	assert.equal(isSafeCommand("git log --grep='npm install' -5"), true);
 });
 
 test("isSafeCommand leaves argument text unscanned and keeps every sink guarded", () => {
@@ -1200,6 +1200,105 @@ test("isSafeCommand leaves argument text unscanned and keeps every sink guarded"
 	}
 });
 
+test("the phrase scan keeps only the npm audit fix clause", () => {
+	// The package-manager and git phrases (`npm install`, `yarn add`, `git commit`) and
+	// the `system(` word were removed from the mutating text scan: each named a mutation
+	// the allowlist already refuses (`yarn`, `pnpm`, `bun`, `pip`, and `uv` have no
+	// entry at all, `git` pins its read-only verbs, and `awk` is not allowlisted), so
+	// the only thing they bought was a refusal of read-only text that mentions them.
+	// Measured against the deny battery before removal: 0 rows broken per phrase.
+	for (const command of [
+		"echo npm install",
+		"echo 'npm install'",
+		'echo "npm install"',
+		"printf '%s\\n' 'npm install'",
+		"cd 'npm install'",
+		"sed -n '1p' 'npm install.txt'",
+		"git log --grep='npm install' -5",
+		"git log --format='yarn add'",
+		"git log -S'npm install' -1",
+		"git log --grep='git commit' -1",
+		"echo system(",
+		"printf 'system(%s)' x",
+		"cd 'system('",
+		"echo n'p'm install",
+		"echo np'm install'",
+		"echo fi'x'",
+	]) {
+		assert.equal(isSafeCommand(command), true, `must be readable: ${command}`);
+	}
+
+	// `npm audit` is allowlisted for its report, so its `fix` subcommand needs the
+	// phrase guard. npm reads `fix` as the first positional argument
+	// (`args[0] === 'fix'`), not as a flag, so a flag in front of it does not turn the
+	// command into a report: every spelling below rewrites the lockfile.
+	for (const command of [
+		"npm audit fix",
+		"npm audit fix --force",
+		"npm audit fix --package-lock-only",
+		"npm audit -- fix",
+		"npm audit --dry-run -- fix",
+		"npm audit --json fix",
+		"npm audit --audit-level=high fix",
+		"npm audit --parseable fix",
+		"npm audit --force fix",
+		"npm audit -d fix",
+		"npm audit 'fix'",
+		'npm audit "fix"',
+		"npm audit --json 'fix'",
+		"npm audit --json fix --dry-run",
+		"npm audit --dry-run --json fix",
+		"npm audit --package-lock-only fix",
+		"npm audit --fix",
+		"npm audit --fix=false",
+		"npm audit fi'x'",
+		"npm audit f\\ix",
+	]) {
+		assert.equal(isSafeCommand(command), false, `must stay refused: ${command}`);
+	}
+
+	// The price of matching `fix` as a token rather than as a flag: a report that names
+	// `fix` as a value is refused too. It is the safe direction, and it is documented in
+	// the README rather than hidden here.
+	assert.equal(isSafeCommand("npm audit --workspace fix"), false);
+
+	// The report forms stay readable, including one that spells `fix` inside a value.
+	for (const command of [
+		"npm audit",
+		"npm audit --json",
+		"npm audit --audit-level=high",
+		"npm audit --parseable",
+		"npm audit --json --registry=https://fix.example/",
+		"npm ls",
+	]) {
+		assert.equal(isSafeCommand(command), true, `must allow: ${command}`);
+	}
+
+	// The removed phrases needed no guard of their own: these mutations are refused by
+	// the allowlist or by a head guard, with no text scan left to help.
+	for (const command of [
+		"npm install",
+		"npm ci",
+		"npm rm x",
+		"yarn add x",
+		"pnpm install",
+		"bun add x",
+		"pip install x",
+		"uv pip install x",
+		"git add .",
+		"git rm -r x",
+		"git mv a b",
+		"xargs rm",
+		"env rm x",
+		"sh -c 'rm x'",
+		"find . -exec rm {} +",
+		"echo hi > out",
+		"awk '{system(\"rm -rf /\")}'",
+	]) {
+		assert.equal(isSafeCommand(command), false, `must stay refused: ${command}`);
+	}
+});
+
 test("hasUnquotedSeparator refuses only a separator that survived the split", () => {
 	const nl = "\n";
 	// The splitter turns every live `;`, `&`, `|`, `|&`, `&&`, `||`, and newline into a
@@ -1237,7 +1336,7 @@ test("isSafeCommand blocks mutations hiding in pipes, redirects, and find flags"
 	assert.equal(isSafeCommand("grep a\nrm -rf /"), false);
 	assert.equal(isSafeCommand("cat <(rm -rf /)"), false);
 	assert.equal(isSafeCommand("echo 'rm -rf /' | sh"), false);
-	assert.equal(isSafeCommand("git log --grep='npm install' -5"), false);
+	assert.equal(isSafeCommand("git log --grep='npm install' -5"), true);
 	assert.equal(isSafeCommand("awk '{system(\"rm -rf /\")}'"), false);
 	assert.equal(isSafeCommand("touch new.md"), false);
 	assert.equal(isSafeCommand("npm install --save-dev typescript"), false);

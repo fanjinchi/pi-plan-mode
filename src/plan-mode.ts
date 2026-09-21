@@ -219,33 +219,35 @@ const PLAN_MODE_QUESTION_PARAMS = {
 } as const;
 
 // Text patterns for mutations that reach the judge with no command word to attribute
-// to them: a write handle (`>`/`>>`), a package-manager or git phrase whose report form
-// is allowlisted, or a call in script text (`system(`). The 13 file-mutating program
-// words (`rm`, `rmdir`, `mv`, `cp`, `mkdir`, `touch`, `chmod`, `chown`, `chgrp`, `ln`,
-// `tee`, `truncate`, `dd`) were removed from this scan: each names a program only as
-// the command word, and every mutation they name is refused without the scan — by the
-// allowlist (they have no entry at all), by a head guard (find, sed, sort, rg, fd,
-// tree, date, bat, git), or by a named flag family. Scanning argument text refused
-// paths, patterns, and printed words instead (`cd /home/u/rm-stuff && ls`,
-// `git log --grep=rm`), so the double-check bought nothing and cost real refusals.
+// to them: a write handle (`>`/`>>`) and the `npm audit fix` subcommand, whose report
+// form is allowlisted. Two further groups used to live here and were measured against
+// the deny battery before being removed, because neither bought a refusal:
+//
+//   - the 13 file-mutating program words (`rm`, `rmdir`, `mv`, `cp`, `mkdir`, `touch`,
+//     `chmod`, `chown`, `chgrp`, `ln`, `tee`, `truncate`, `dd`) name a program only as
+//     the command word, and every mutation they name is refused without the scan — by
+//     the allowlist (they have no entry at all), by a head guard (find, sed, sort, rg,
+//     fd, tree, date, bat, git), or by a named flag family;
+//   - the package-manager and git phrases (`npm install`, `yarn add`, `git commit`)
+//     and the `system(` word each named a mutation the allowlist already refuses:
+//     `yarn`, `pnpm`, `bun`, `pip`, and `uv` have no allowlist entry at all, `git`
+//     pins its read-only verbs, and `awk` — the only allowlisted program that could
+//     reach `system(` — is not allowlisted either.
+//
+// Scanning argument text only cost refusals of read-only text, then: it reads the
+// segment with its quotes intact, so `cd /home/u/rm-stuff && ls`,
+// `git log --grep='npm install' -5`, and `echo system(` were refused for a word they
+// merely print. The clause kept is the one with a real sink behind it: `npm audit` is
+// allowlisted below for its report, so without a phrase guard its `fix` subcommand
+// runs through and rewrites the lockfile. npm reads `fix` as the first positional
+// argument (`args[0] === 'fix'`), not as a flag, so the pattern tolerates the flags in
+// front of it: `npm audit --json fix` and `npm audit fix --force` are the same
+// mutation as `npm audit fix`. The price is one refusal in the safe direction: a
+// report that names `fix` as a flag value (`npm audit --workspace fix`) matches too.
 const MUTATING_BASH_PATTERNS = [
 	/(^|[^<])>(?!>)/,
 	/>>/,
-	/\bnpm\s+(install|uninstall|update|ci|link|publish|version)\b/i,
-	// `npm audit` is allowlisted below for its report; its `fix` subcommand rewrites
-	// the workspace (it installs packages and edits the lockfile), so both spellings of
-	// the subcommand are named here and the report form stays allowed.
-	/\bnpm\s+audit\s+(?:fix\b|--fix\b)/i,
-	/\byarn\s+(add|remove|install|publish|upgrade)\b/i,
-	/\bpnpm\s+(add|remove|install|publish|update)\b/i,
-	/\bbun\s+(add|remove|install|update|publish)\b/i,
-	/\bpip\s+(install|uninstall)\b/i,
-	/\buv\s+(add|remove|sync|lock|pip\s+install)\b/i,
-	// `stash` and `tag` are missing on purpose: their listing forms are allowlisted
-	// below (`git stash list`, `git tag -l`), and those patterns pin the listing
-	// verb, so the mutating subcommands already fail the allowlist first.
-	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|switch|cherry-pick|revert|init|clone)\b/i,
-	/\bsystem\s*\(/i,
+	/^\s*npm\s+audit(?:\s+\S+)*\s+(?:fix\b|--fix\b)/i,
 ];
 
 // Programs this judge never treats as read-only, whatever their arguments: editors
@@ -1671,8 +1673,9 @@ function judgeSafeCommand(command: string) {
 }
 
 /**
- * Judge one command segment: its command word, its flags, and any mutating keyword
- * that survived the allowlist. It runs for the raw segment and again for the
+ * Judge one command segment: its command word, its flags, and the mutating text
+ * patterns (a write handle, the `npm audit fix` subcommand) that survived the
+ * allowlist. It runs for the raw segment and again for the
  * normalized reading of that segment, so each spelling has to pass on its own while
  * the head is resolved the way bash resolves it. `reading` names which of the two is
  * being judged: a check that counts words has to say so, because the normalized text
@@ -1825,17 +1828,17 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 	if (PURE_READ_BASH_COMMANDS.has(head)) return true;
 
 	// Non-pure-read heads (echo, printf, git, npm, env, ...) are checked against the
-	// text patterns above on the full segment text (quotes intact) — e.g.
-	// `git log --grep='npm install' -5` stays blocked by the dependency phrase. The
-	// words that name a program (editors, shells, privilege and process tools, and the
-	// file-mutating commands) are not matched here any more: the first group is
+	// text patterns above on the full segment text (quotes intact). The words that name
+	// a program (editors, shells, privilege and process tools, and the file-mutating
+	// commands) are not matched here any more: the first group is
 	// FORBIDDEN_PROGRAM_HEADS, and the second has no allowlist entry to reach this
 	// point, so a path, a pattern, or a printed word that contains one is not a reason
-	// to refuse. That leaves argument text unscanned for those words, which is why an
-	// allowlisted head that can execute a verbatim argument needs its own guard (find
-	// `-exec`/`-delete`, sed's script grammar, `sort -o`/`-T`, `uniq INPUT OUTPUT`, the
-	// git and package-manager phrase entries): keep that requirement when you add an
-	// allowlist entry.
+	// to refuse — `git log --grep='npm install' -5` is a search, not an install. That
+	// leaves argument text unscanned, which is why an allowlisted head that can execute
+	// a verbatim argument needs its own guard (find `-exec`/`-delete`, sed's script
+	// grammar, `sort -o`/`-T`, `uniq INPUT OUTPUT`, and the npm-audit clause above,
+	// which guards the one phrase whose report form is allowlisted): keep that
+	// requirement when you add an allowlist entry.
 	const segmentNoFdRedirs = segment.replace(/\b[012]>&[012]\b/g, "");
 	if (MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(segmentNoFdRedirs))) return false;
 
