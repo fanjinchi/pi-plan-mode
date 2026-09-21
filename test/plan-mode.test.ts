@@ -1403,6 +1403,54 @@ test("isSafeCommand refuses hidden separators and unquoted expansion", () => {
 	assert.equal(isSafeCommand("cat f # canaryrun"), true);
 });
 
+test("isSafeCommand refuses brace and pathname expansion instead of modelling them", () => {
+	// Bash rewrites the source words with brace expansion and then pathname expansion
+	// before the command starts, so the judge reads one literal word while the command
+	// receives another: every form below really wrote a file, deleted one, or ran a
+	// program when it was allowed (`sort --out{put=OUT,put=OUT} a.txt` and
+	// `git log --outpu[t]=OUT a.txt` wrote OUT, `rg --pre{=canaryprogram,=canaryprogram} x .`
+	// and `rg --pre* x .` ran canaryprogram, `find . -{delete,true}` and
+	// `find . -del*` deleted the fixture, `npm audit {fix,}` and `npm audit *` handed
+	// npm a first positional argument of `fix`).
+	assert.equal(isSafeCommand("find . -{delete,true}"), false);
+	assert.equal(isSafeCommand("sort --out{put=OUT,put=OUT} a.txt"), false);
+	assert.equal(isSafeCommand("git log --out{put=OUT,put=OUT} -1"), false);
+	assert.equal(isSafeCommand("rg --pre{=canaryprogram,=canaryprogram} x ."), false);
+	assert.equal(isSafeCommand("npm audit {fix,}"), false);
+	assert.equal(isSafeCommand("npm audit {,fix}"), false);
+	assert.equal(isSafeCommand("npm audit --registry=https://registry.npmjs.org {fix,}"), false);
+	assert.equal(isSafeCommand("find . -{p,t}rint x"), false);
+	assert.equal(isSafeCommand("ls *.{ts,js}"), false);
+	assert.equal(isSafeCommand("echo a{1..3}"), false);
+	// A glob is the same hole with the file names of the repository as its input: a
+	// checkout carrying a file named `--output=OUT` or `-delete` decides the word.
+	assert.equal(isSafeCommand("sort *"), false);
+	assert.equal(isSafeCommand("git log *"), false);
+	assert.equal(isSafeCommand("git log --outpu*"), false);
+	assert.equal(isSafeCommand("find . -del*"), false);
+	assert.equal(isSafeCommand("rg --pre* x ."), false);
+	assert.equal(isSafeCommand("npm audit *"), false);
+	assert.equal(isSafeCommand("sort --outpu[t]=OUT a.txt"), false);
+	assert.equal(isSafeCommand("sort --outpu?=OUT a.txt"), false);
+	assert.equal(isSafeCommand("ls *.ts"), false);
+	assert.equal(isSafeCommand("find . -name *.ts"), false);
+	assert.equal(isSafeCommand("cat [abc].txt"), false);
+	assert.equal(isSafeCommand("find . -exec rm {} +"), false);
+
+	// Quoting and escaping keep the characters literal, exactly as they do for `$`: bash
+	// runs neither expansion on text it only produces after quote removal, so a quoted
+	// glob, brace or bracket expression is an argument and stays usable.
+	assert.equal(isSafeCommand("find src -name '*.ts'"), true);
+	assert.equal(isSafeCommand("git tag --list 'v*'"), true);
+	assert.equal(isSafeCommand("grep -rn -- '--outpu[t]' ."), true);
+	assert.equal(isSafeCommand("grep -rn '{}' ."), true);
+	assert.equal(isSafeCommand("sort 'a*.txt'"), true);
+	assert.equal(isSafeCommand('grep -rn "*.ts" .'), true);
+	assert.equal(isSafeCommand("echo a \\{b,c\\}"), true);
+	assert.equal(isSafeCommand("git branch --show-current"), true);
+	assert.equal(isSafeCommand("ls ."), true);
+});
+
 test("isSafeCommand judges continuations and quote roles the way bash does", () => {
 	// A backslash-newline is a line continuation: bash deletes it before it looks for
 	// words, so `sort -\⏎o OUT f` is `sort -o OUT f` and writes a file. The judge used to

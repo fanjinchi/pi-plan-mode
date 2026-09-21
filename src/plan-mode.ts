@@ -1491,14 +1491,31 @@ function scanShellText(command: string): ShellCharRole[] {
 }
 
 /**
- * True when the shell would expand something: an unescaped `$` or backtick outside
- * single quotes, a double-quoted one included (`echo "' $(x) '"` expands).
+ * True when the shell would rewrite the text before any command sees it, in one place
+ * for both ways it can do that:
+ *
+ * - an unescaped `$` or backtick outside single quotes, a double-quoted one included
+ *   (`echo "' $(x) '"` expands), and
+ * - an unquoted `{`, `}`, `*`, `?` or `[`: bash runs brace expansion and then pathname
+ *   expansion on the source words before the command is started, so the judge reads
+ *   `--out{put,}`, `--outpu[t]=OUT` and `--pre*` as one literal word while bash hands
+ *   the command `--output` and `--pre=canaryprogram`. Quoted and escaped characters are
+ *   still data, because neither expansion applies to text the shell produces only after
+ *   quote removal (that is also why the `$'…'` decoding of `bashNormalized` needs no
+ *   re-check). Refusing the syntax beats modelling it: a glob expands to the file names
+ *   of the repository being read, which the judge cannot see.
  */
 function hasExpansion(command: string): boolean {
 	const roles = scanShellText(command);
 	for (let i = 0; i < command.length; i++) {
-		if (roles[i] === "single" || roles[i] === "escaped") continue;
-		if (command[i] === "$" || command[i] === "`") return true;
+		const role = roles[i];
+		if (role === "single" || role === "escaped") continue;
+		const ch = command[i];
+		// `$` and backticks expand inside double quotes too.
+		if (ch === "$" || ch === "`") return true;
+		// Brace and pathname expansion only rewrite unquoted words, so `"*.ts"` is data.
+		if (role === "unquoted" && (ch === "{" || ch === "}" || ch === "*" || ch === "?" || ch === "["))
+			return true;
 	}
 	return false;
 }
