@@ -1496,14 +1496,21 @@ function scanShellText(command: string): ShellCharRole[] {
  *
  * - an unescaped `$` or backtick outside single quotes, a double-quoted one included
  *   (`echo "' $(x) '"` expands), and
- * - an unquoted `{`, `}`, `*`, `?` or `[`: bash runs brace expansion and then pathname
- *   expansion on the source words before the command is started, so the judge reads
- *   `--out{put,}`, `--outpu[t]=OUT` and `--pre*` as one literal word while bash hands
- *   the command `--output` and `--pre=canaryprogram`. Quoted and escaped characters are
- *   still data, because neither expansion applies to text the shell produces only after
- *   quote removal (that is also why the `$'…'` decoding of `bashNormalized` needs no
- *   re-check). Refusing the syntax beats modelling it: a glob expands to the file names
- *   of the repository being read, which the judge cannot see.
+ * - an unquoted `{`, `}`, `*`, `?`, `[`, `(`, `)`, or `!`: bash runs brace expansion and
+ *   then pathname expansion on the source words before the command is started, so the judge
+ *   reads `--out{put,}`, `--outpu[t]=OUT` and `--pre*` as one literal word while bash hands
+ *   the command `--output` and `--pre=canaryprogram`. The parentheses and `!` are refused
+ *   with the glob characters because they are the extglob syntax for the same thing: with
+ *   extglob enabled — an inherited `BASHOPTS=extglob` in the interpreter's own environment,
+ *   which no command text can set and no command text has to name — `!(a.txt)` and
+ *   `@(a|b).txt` are patterns the file names of the repository decide, exactly like `*`
+ *   (`bash -c` would not even start without extglob, which is why the syntax is only
+ *   reachable in that environment, and why refusing it costs a read-only command like
+ *   `find . ! -name x`). Quoted and escaped characters are still data, because neither
+ *   expansion applies to text the shell produces only after quote removal (that is also
+ *   why the `$'…'` decoding of `bashNormalized` needs no re-check). Refusing the syntax
+ *   beats modelling it: a glob expands to the file names of the repository being read,
+ *   which the judge cannot see.
  */
 function hasExpansion(command: string): boolean {
 	const roles = scanShellText(command);
@@ -1513,8 +1520,18 @@ function hasExpansion(command: string): boolean {
 		const ch = command[i];
 		// `$` and backticks expand inside double quotes too.
 		if (ch === "$" || ch === "`") return true;
-		// Brace and pathname expansion only rewrite unquoted words, so `"*.ts"` is data.
-		if (role === "unquoted" && (ch === "{" || ch === "}" || ch === "*" || ch === "?" || ch === "["))
+		// Brace, pathname and extglob expansion only rewrite unquoted words, so `"*.ts"` is data.
+		if (
+			role === "unquoted" &&
+			(ch === "{" ||
+				ch === "}" ||
+				ch === "*" ||
+				ch === "?" ||
+				ch === "[" ||
+				ch === "(" ||
+				ch === ")" ||
+				ch === "!")
+		)
 			return true;
 	}
 	return false;
@@ -1761,12 +1778,16 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 	// flag.
 	if (head === "sed") {
 		const sedFlags = segment.replace(/"[^"]*"|'[^']*'/g, " ");
-		if (
-			/(?:^|\s)(?:--in-place\b|--file\b|-f\b|-e\b|--expression\b|-[a-zA-Z.]*i[a-zA-Z.]*)/i.test(
-				sedFlags,
-			)
-		)
-			return false;
+		if (/(?:^|\s)(?:-f\b|-e\b|-[a-zA-Z.]*i[a-zA-Z.]*)/i.test(sedFlags)) return false;
+		// The long spellings of those three flags are refused by the shared resolver
+		// instead of by name, because sed accepts any unambiguous abbreviation: `--i`,
+		// `--in`, `--in-p`, `--f`, `--e` and `--exp` reach `--in-place`, `--file` and
+		// `--expression` without ever spelling one of them, which is how the pair of
+		// literal checks this replaced was bypassed. A sed long option that is not on
+		// the exact read-only allowlist is refused as unknown as well: the script this
+		// judge reads is not the script sed runs once an abbreviation has added a
+		// second one, and a name nothing here has heard of cannot be reasoned about.
+		if (hasUnknownLongOption(sedFlags, SED_SAFE_LONG_OPTIONS)) return false;
 		// The flags are not the whole hazard: a script can write files (the `w`/`W`
 		// command, `s///w file`) and run commands (GNU's `e` command, `s///e`), and
 		// that is exactly the text the flag check above drops. Telling a read-only
@@ -1793,10 +1814,15 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 		if (hasDangerousLongOption(segment, SORT_WRITE_OPTIONS)) return false;
 	}
 
-	// rg runs the `--pre`/`--pre-glob` command for every file it scans, and fd runs
-	// whatever `-x`/`-X`/`--exec`/`--exec-batch` name. Both sit in
-	// PURE_READ_BASH_COMMANDS, so nothing else looks at their flags.
-	if (head === "rg" && hasDangerousLongOption(segment, RG_EXEC_OPTIONS)) return false;
+	// rg runs the `--pre`/`--pre-glob` command for every file it scans, runs the
+	// decompressor a `-z`/`--search-zip` file suffix names, and runs the program
+	// `--hostname-bin` names. fd runs whatever `-x`/`-X`/`--exec`/`--exec-batch`
+	// name. Both sit in PURE_READ_BASH_COMMANDS, so nothing else looks at their
+	// flags.
+	if (head === "rg") {
+		if (hasDangerousShortFlag(segment, "z")) return false;
+		if (hasDangerousLongOption(segment, RG_EXEC_OPTIONS)) return false;
+	}
 	if (head === "fd") {
 		if (hasDangerousShortFlag(segment, "xX")) return false;
 		if (hasDangerousLongOption(segment, FD_EXEC_OPTIONS)) return false;
@@ -1814,6 +1840,10 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 		if (hasDangerousLongOption(segment, DATE_SET_OPTIONS)) return false;
 	}
 	if (head === "bat" && hasDangerousLongOption(segment, BAT_EXEC_OPTIONS)) return false;
+
+	// `diff --paginate` pipes the diff through `pr`, a program from PATH, the same
+	// delegation as `rg --search-zip` and `rg --pre` and refused with them.
+	if (head === "diff" && hasDangerousLongOption(segment, DIFF_EXEC_OPTIONS)) return false;
 
 	// `uniq` takes its output file as a positional argument (`uniq INPUT OUTPUT`), so a
 	// second non-flag word is a write handle rather than a second input. Words are
@@ -1858,6 +1888,15 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 	// requirement when you add an allowlist entry.
 	const segmentNoFdRedirs = segment.replace(/\b[012]>&[012]\b/g, "");
 	if (MUTATING_BASH_PATTERNS.some((pattern) => pattern.test(segmentNoFdRedirs))) return false;
+	// npm resolves a long option by unambiguous prefix too, so `npm audit --fi`
+	// reaches the `--fix` flag the clause above spells out. The positional form
+	// (`npm audit fix`) is the pattern's job, and `--force` is not a prefix of
+	// `--fix`, so the reporting flags stay usable.
+	if (
+		/^\s*npm\s+audit\b/i.test(segmentNoFdRedirs) &&
+		hasDangerousLongOption(segmentNoFdRedirs, ["--fix"])
+	)
+		return false;
 
 	return true;
 }
@@ -1995,14 +2034,37 @@ function decodeAnsiCString(command: string, start: number): [string, number] {
 // Options that turn a read-only command into a launcher or a writer. Each list is
 // matched by prefix (see hasDangerousLongOption), so it covers the abbreviated
 // spellings these parsers accept as well as the full ones.
+// sed is judged by a print-only grammar for its script, so its flags only have to stop
+// a second script or a write handle: the dangerous names add a script
+// (`--expression`/`-e`, `--file`/`-f`) or edit in place (`--in-place`/`-i`), and sed
+// accepts any unambiguous abbreviation of them (`--e`, `--exp`, `--f`, `--i`, `--in-p`).
+// Rather than list those names, the allowlist below is the whole set of sed long options
+// that stays read-only with a print script, and every other long option is refused as
+// unknown — including `--follow-symlinks` and `--binary`, which need `--in-place` to do
+// anything, and including the abbreviations of the names on this list, which cost nothing
+// because the short spellings (`-n`, `-s`, `-u`, `-z`) are unaffected.
+const SED_SAFE_LONG_OPTIONS = [
+	"--quiet",
+	"--silent",
+	"--posix",
+	"--regexp-extended",
+	"--separate",
+	"--unbuffered",
+	"--null-data",
+	"--sandbox",
+	"--debug",
+	"--help",
+	"--version",
+];
 const SORT_WRITE_OPTIONS = ["--output", "--compress-program", "--temporary-directory"];
 // ripgrep runs a program for `--pre`/`--pre-glob`, and `--hostname-bin` names the
 // program it runs to resolve the hostname it prints in its header. `--pager` is not a
 // ripgrep flag (checked against `rg --help`), so it is not listed.
-const RG_EXEC_OPTIONS = ["--pre", "--pre-glob", "--hostname-bin"];
+const RG_EXEC_OPTIONS = ["--pre", "--pre-glob", "--hostname-bin", "--search-zip"];
 const FD_EXEC_OPTIONS = ["--exec", "--exec-batch"];
 const TREE_WRITE_OPTIONS = ["--output"];
 const DATE_SET_OPTIONS = ["--set"];
+const DIFF_EXEC_OPTIONS = ["--paginate"];
 // bat starts a pager program with `--pager`, and `--config-file` can point at a file
 // whose contents name one (a file the caller may be able to write).
 const BAT_EXEC_OPTIONS = ["--pager", "--config-file"];
@@ -2018,21 +2080,49 @@ const GIT_EXEC_OPTIONS = [
 ];
 
 /**
- * A long option may be abbreviated to any unambiguous prefix (`--o`, `--ou`,
- * `--out` and `--output` are the same flag to sort), so a token is refused when its
- * option part — the text before `=` — is a prefix of one of the dangerous options.
- * Comparing against the full names covers every abbreviation without listing them,
- * and the full spelling with them.
+ * The option word of every `--long` token in a segment: the text before `=`, lower
+ * cased, with a leading quote dropped (`"--out=o"` is the flag `--out` to the program
+ * that receives it). A value that is not joined by `=` is a token of its own, so an
+ * option that takes one is visible here either way. A token that is exactly `--` is
+ * not an option and is skipped, and so is a token whose option word is empty.
  */
-function hasDangerousLongOption(segment: string, options: readonly string[]): boolean {
+function longOptionTokens(segment: string): string[] {
+	const options: string[] = [];
 	for (const rawToken of segment.split(/\s+/)) {
 		const token = rawToken.replace(/^['"]+/, "").toLowerCase();
 		if (!token.startsWith("--")) continue;
 		const equals = token.indexOf("=");
 		const option = equals === -1 ? token : token.slice(0, equals);
-		if (option.length > 2 && options.some((dangerous) => dangerous.startsWith(option))) return true;
+		if (option.length > 2) options.push(option);
 	}
-	return false;
+	return options;
+}
+
+/**
+ * A long option may be abbreviated to any unambiguous prefix (`--o`, `--ou`,
+ * `--out` and `--output` are the same flag to sort), so a token is refused when its
+ * option word is a prefix of one of the dangerous names. Comparing against the full
+ * names covers every abbreviation without listing them, and the full spelling with
+ * them. This is the one resolver the guards below read their long options through:
+ * sort, rg, fd, tree, date, bat, diff, git and the npm-audit clause all use it, so a
+ * family cannot drift back into matching a spelling.
+ */
+function hasDangerousLongOption(segment: string, options: readonly string[]): boolean {
+	return longOptionTokens(segment).some((option) =>
+		options.some((dangerous) => dangerous.startsWith(option)),
+	);
+}
+
+/**
+ * The inverse of `hasDangerousLongOption`, for a program whose whole flag set is not
+ * known: every long option has to be on the allowlist by exact spelling. An
+ * abbreviation is refused even when it would resolve to an allowed name, and a name
+ * nothing here has heard of is refused too, which is what sed needs — its flag scan
+ * was literal once and the abbreviations of `--in-place`, `--file` and `--expression`
+ * were reachable through it.
+ */
+function hasUnknownLongOption(segment: string, allowed: readonly string[]): boolean {
+	return longOptionTokens(segment).some((option) => !allowed.includes(option));
 }
 
 /**

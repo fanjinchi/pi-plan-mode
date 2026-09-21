@@ -802,6 +802,12 @@ test("isSafeCommand refuses exec-vector flags and the launchers that hide a head
 		"rg --pre-glob '*.sh' --pre x a f",
 		"rg --pre=/tmp/x a f",
 		"rg --pr /tmp/x a f",
+		// ripgrep runs the decompressor a `-z`/`--search-zip` suffix names, so the flag
+		// is refused with the rest of the family, abbreviation included.
+		"rg -z x .",
+		"rg -nz x .",
+		"rg --sea x .",
+		"rg --search-zip x .",
 		"fd -x rm",
 		"fd -X rm",
 		"fd --exec rm",
@@ -822,6 +828,30 @@ test("isSafeCommand refuses exec-vector flags and the launchers that hide a head
 		"npm audit fix",
 		"npm audit fix --force",
 		"npm audit --fix",
+		// npm resolves a long option by prefix as well, so the flag the clause above
+		// spells out is reachable as `--fi`.
+		"npm audit --fi",
+		"npm audit --fi --json",
+		// sed's flag scan was literal, so the abbreviations of the in-place write and
+		// of the second script got past it: `--i`, `--in` and `--in-p` reach
+		// `--in-place`, `--e` and `--exp` reach `--expression`, and `--f` reaches
+		// `--file`. Every spelling below is refused by the shared resolver, whether the
+		// value is joined with `=` or separated.
+		"sed -n '1p' a.txt --i",
+		"sed -n '1p' a.txt --in",
+		"sed -n '1p' a.txt --in-p",
+		"sed -n '1p' a.txt --in-place",
+		"sed -n '1p' a.txt --e '1e canaryprogram'",
+		"sed -n '1p' a.txt --e='1e canaryprogram'",
+		"sed -n '1p' a.txt --exp 'w out'",
+		"sed -n '1p' a.txt --exp='w out'",
+		"sed -n '1p' a.txt --expression='w out'",
+		"sed -n '1p' a.txt --f script.sed",
+		"sed -n '1p' a.txt --f=script.sed",
+		"sed -n '1p' a.txt --file=script.sed",
+		// `diff --paginate` pipes the diff through `pr`, a program from PATH.
+		"diff --paginate a b",
+		"diff --pag a b",
 		// `uniq INPUT OUTPUT` writes its second positional argument.
 		"uniq u.txt u.out",
 		// git's `-O` / `--open-files-in-pager` hands the output to a command.
@@ -830,6 +860,27 @@ test("isSafeCommand refuses exec-vector flags and the launchers that hide a head
 		"git log --open-files-in-pager -1",
 	]) {
 		assert.equal(isSafeCommand(command), false, `must block: ${command}`);
+	}
+
+	// The read-only spellings of the same commands stay usable: the flags that only
+	// modify the read (or the report) are unaffected, and a sed print script is still
+	// the field-extraction tool the allowlist offers.
+	for (const command of [
+		"rg -n x .",
+		"rg -n --no-heading x .",
+		"sort f",
+		"diff a b",
+		"diff -u a b",
+		"npm audit",
+		"npm audit --json",
+		"npm audit --force",
+		"sed -n '1p' a.txt",
+		"sed -n '1,20p' f",
+		"sed -n '$p' f",
+		"sed -n '1p' a.txt --quiet",
+		"sed -n '1p' a.txt --sandbox",
+	]) {
+		assert.equal(isSafeCommand(command), true, `must allow: ${command}`);
 	}
 
 	// `less` is refused outright: its own command language writes files (`-o`) and runs
@@ -928,6 +979,25 @@ test("isSafeCommand refuses path-shaped heads, mutating git forms, and in-place 
 	assert.equal(isSafeCommand("sed -i.bak 's/a/b/' f"), false);
 	assert.equal(isSafeCommand("sed --in-place 's/a/b/' f"), false);
 	assert.equal(isSafeCommand("sed -n -f script.sed f"), false);
+	// sed accepts any unambiguous abbreviation of a long option, so the write handle
+	// and the second script are refused through the shared resolver rather than by
+	// spelling: `--i`/`--in`/`--in-p` reach `--in-place`, `--e`/`--exp` reach
+	// `--expression`, `--f` reaches `--file`, joined by `=` or separated.
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --i"), false);
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --in"), false);
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --in-p"), false);
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --e '1e canaryprogram'"), false);
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --e='1e canaryprogram'"), false);
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --exp 'w out'"), false);
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --exp='w out'"), false);
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --f script.sed"), false);
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --f=script.sed"), false);
+	// A long option nothing here has heard of is refused as unknown, and the read-only
+	// spellings on the allowlist stay (a long option is read wherever GNU sed takes it,
+	// which the script extraction only accepts after the script).
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --follow-symlinks"), false);
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --quiet"), true);
+	assert.equal(isSafeCommand("sed -n '1p' a.txt --sandbox"), true);
 	// A quoted script that merely mentions `-i` is not a flag — but substitution is
 	// no longer allowlisted at all: only print scripts pass the grammar, so this row
 	// now pins the narrowing instead of the quoting rule it used to pin.
@@ -1069,7 +1139,9 @@ test("isSafeCommand allows read-only searches whose patterns mention mutating wo
 	assert.equal(isSafeCommand('rg -n "vim" ~/.pi/agent/npm/node_modules/'), true);
 	assert.equal(isSafeCommand('grep -rn "a > b" .'), true);
 	assert.equal(isSafeCommand("grep -rn code ~/.pi/agent/skills/open-code-review"), true);
-	assert.equal(isSafeCommand("grep -rn system( src/"), true);
+	// Quoted, a pattern that mentions `system(` is still a search: the parentheses are
+	// text to grep, while an unquoted one is refused with the extglob characters.
+	assert.equal(isSafeCommand("grep -rn 'system(' src/"), true);
 	assert.equal(isSafeCommand("grep -rn '$(x)' docs/"), true);
 	assert.equal(isSafeCommand("grep foo ~/.pi 2>&1 | head -20"), true);
 	assert.equal(isSafeCommand("cd ~/.pi/agent/skills && grep -rn context ."), true);
@@ -1218,7 +1290,7 @@ test("the phrase scan keeps only the npm audit fix clause", () => {
 		"git log --format='yarn add'",
 		"git log -S'npm install' -1",
 		"git log --grep='git commit' -1",
-		"echo system(",
+		"echo 'system('",
 		"printf 'system(%s)' x",
 		"cd 'system('",
 		"echo n'p'm install",
@@ -1321,6 +1393,14 @@ test("hasUnquotedSeparator refuses only a separator that survived the split", ()
 	assert.equal(isSafeCommand("cat f 2>&1"), true);
 	assert.equal(isSafeCommand("echo 'a; b' ; sort -n f"), true);
 	assert.equal(isSafeCommand("echo a \\; git tag -d v2"), true);
+	// A trailing separator leaves an empty part, which the splitter drops instead of
+	// judging: `echo hi &` starts one read-only command in the background, and the same
+	// holds for a `&` between two read-only commands. This pins the `&` cut itself, so a
+	// change that turns every trailing `&` into a refusal is not silently accepted.
+	assert.equal(isSafeCommand("echo hi &"), true);
+	assert.equal(isSafeCommand("echo hi & echo bye"), true);
+	assert.equal(isSafeCommand("cat f &"), true);
+	assert.equal(isSafeCommand("cat f & git tag -d v2"), false);
 });
 
 test("isSafeCommand blocks mutations hiding in pipes, redirects, and find flags", () => {
@@ -1418,6 +1498,16 @@ test("isSafeCommand refuses brace and pathname expansion instead of modelling th
 	assert.equal(isSafeCommand("rg --pre{=canaryprogram,=canaryprogram} x ."), false);
 	assert.equal(isSafeCommand("npm audit {fix,}"), false);
 	assert.equal(isSafeCommand("npm audit {,fix}"), false);
+	// Extglob syntax is the same agreement with the shell: with extglob enabled — an
+	// inherited `BASHOPTS=extglob` in the interpreter's environment, which no command
+	// text can set — `!(a.txt)` is a pattern the file names of the repository decide,
+	// so the characters are refused unquoted like the glob ones. The cost is the
+	// read-only `find . ! -name x` spelling.
+	assert.equal(isSafeCommand("printf '%s\\n' !(*.txt)"), false);
+	assert.equal(isSafeCommand("sort !(a.txt)"), false);
+	assert.equal(isSafeCommand("ls @(a).txt"), false);
+	assert.equal(isSafeCommand("find . ! -name x"), false);
+	assert.equal(isSafeCommand("grep -n foo(bar ."), false);
 	assert.equal(isSafeCommand("npm audit --registry=https://registry.npmjs.org {fix,}"), false);
 	assert.equal(isSafeCommand("find . -{p,t}rint x"), false);
 	assert.equal(isSafeCommand("ls *.{ts,js}"), false);
@@ -1447,6 +1537,10 @@ test("isSafeCommand refuses brace and pathname expansion instead of modelling th
 	assert.equal(isSafeCommand("sort 'a*.txt'"), true);
 	assert.equal(isSafeCommand('grep -rn "*.ts" .'), true);
 	assert.equal(isSafeCommand("echo a \\{b,c\\}"), true);
+	// Quoted, the extglob characters are data like every other expansion syntax.
+	assert.equal(isSafeCommand("grep -n 'foo(bar)' ."), true);
+	assert.equal(isSafeCommand("find . -name '!x'"), true);
+	assert.equal(isSafeCommand("echo '!(x)'"), true);
 	assert.equal(isSafeCommand("git branch --show-current"), true);
 	assert.equal(isSafeCommand("ls ."), true);
 });
