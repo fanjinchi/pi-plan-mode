@@ -1818,7 +1818,8 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 	// decompressor a `-z`/`--search-zip` file suffix names, and runs the program
 	// `--hostname-bin` names. fd runs whatever `-x`/`-X`/`--exec`/`--exec-batch`
 	// name. Both sit in PURE_READ_BASH_COMMANDS, so nothing else looks at their
-	// flags.
+	// flags, and both spellings of every one of those flags reach the letter set
+	// below (a `--z` is a `-z` to ripgrep, `--x` is a `-x` to fd).
 	if (head === "rg") {
 		if (hasDangerousShortFlag(segment, "z")) return false;
 		if (hasDangerousLongOption(segment, RG_EXEC_OPTIONS)) return false;
@@ -1841,9 +1842,21 @@ function judgeSegment(segment: string, reading: "raw" | "normalized"): boolean {
 	}
 	if (head === "bat" && hasDangerousLongOption(segment, BAT_EXEC_OPTIONS)) return false;
 
-	// `diff --paginate` pipes the diff through `pr`, a program from PATH, the same
-	// delegation as `rg --search-zip` and `rg --pre` and refused with them.
-	if (head === "diff" && hasDangerousLongOption(segment, DIFF_EXEC_OPTIONS)) return false;
+	// `diff --paginate` pipes the diff through `pr` (a hardcoded /usr/bin/pr, so PATH
+	// cannot redirect it, but still a program this judge cannot see), and `diff -l` is the
+	// documented short spelling of the same flag. The remaining diff flags reformat text.
+	if (head === "diff") {
+		if (hasDangerousShortFlag(segment, "l")) return false;
+		if (hasDangerousLongOption(segment, DIFF_EXEC_OPTIONS)) return false;
+	}
+
+	// `file` is in PURE_READ_BASH_COMMANDS for its ordinary forms (`file f`,
+	// `file -m magic f`), but `-C` compiles a magic file and so creates `<name>.mgc`
+	// beside it. `--C` reaches the same flag through the letter fold.
+	if (head === "file") {
+		if (hasDangerousShortFlag(segment, "C")) return false;
+		if (hasDangerousLongOption(segment, FILE_WRITE_OPTIONS)) return false;
+	}
 
 	// `uniq` takes its output file as a positional argument (`uniq INPUT OUTPUT`), so a
 	// second non-flag word is a write handle rather than a second input. Words are
@@ -2065,6 +2078,11 @@ const FD_EXEC_OPTIONS = ["--exec", "--exec-batch"];
 const TREE_WRITE_OPTIONS = ["--output"];
 const DATE_SET_OPTIONS = ["--set"];
 const DIFF_EXEC_OPTIONS = ["--paginate"];
+// `file -C` writes the compiled magic database beside its source (`file -C -m magic`
+// creates `magic.mgc`). The long spelling abbreviates the same way sed's do (`--compile`,
+// `--comp`, `--co`), which the shared prefix resolver covers; `file -m magic f` and
+// `file -c -m magic` stay read-only.
+const FILE_WRITE_OPTIONS = ["--compile"];
 // bat starts a pager program with `--pager`, and `--config-file` can point at a file
 // whose contents name one (a file the caller may be able to write).
 const BAT_EXEC_OPTIONS = ["--pager", "--config-file"];
@@ -2128,10 +2146,21 @@ function hasUnknownLongOption(segment: string, allowed: readonly string[]): bool
 /**
  * Short flags can share one token (`sort -nroOUT f` is `-o OUT`), so every letter of
  * every short-flag token is checked against the dangerous set.
+ *
+ * A two-dash single-letter token is folded onto its short form first: ripgrep's own
+ * parser reads `--z` as `-z` rather than as a long-option abbreviation, and it is not
+ * the only program that accepts that spelling, so `rg --z` used to run the decompressor
+ * a `.bz2` suffix names while `rg -z` was refused. Folding here, in the one helper every
+ * head reads its short flags through, means a head cannot miss the spelling — a new
+ * guard gets `-X` and `--X` from the same letter set.
  */
 function hasDangerousShortFlag(segment: string, letters: string): boolean {
 	const pattern = new RegExp(`^-[a-zA-Z]*[${letters}]`);
-	return segment.split(/\s+/).some((rawToken) => pattern.test(rawToken.replace(/^['"]+/, "")));
+	return segment
+		.split(/\s+/)
+		.some((rawToken) =>
+			pattern.test(rawToken.replace(/^['"]+/, "").replace(/^--(?=[a-zA-Z]$)/, "-")),
+		);
 }
 
 // PowerShell needs its own dialect. The POSIX allowlist matches whole command

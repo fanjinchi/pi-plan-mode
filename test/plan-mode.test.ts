@@ -803,9 +803,13 @@ test("isSafeCommand refuses exec-vector flags and the launchers that hide a head
 		"rg --pre=/tmp/x a f",
 		"rg --pr /tmp/x a f",
 		// ripgrep runs the decompressor a `-z`/`--search-zip` suffix names, so the flag
-		// is refused with the rest of the family, abbreviation included.
+		// is refused with the rest of the family, abbreviation included, and ripgrep's own
+		// reading of a two-dash single letter (`--z` is `-z` to it) is folded onto the short
+		// flag for every head.
 		"rg -z x .",
 		"rg -nz x .",
+		"rg --z x .",
+		"rg --z x raw.txt.bz2",
 		"rg --sea x .",
 		"rg --search-zip x .",
 		"fd -x rm",
@@ -814,6 +818,8 @@ test("isSafeCommand refuses exec-vector flags and the launchers that hide a head
 		"fd --exec-batch rm",
 		"fd -Hx rm",
 		"fd --exe rm",
+		"fd --x rm",
+		"fd --X rm",
 		"ag --pager 'sh -c x' a .",
 		"tree -o /tmp/x",
 		"tree --output=/tmp/x",
@@ -849,9 +855,19 @@ test("isSafeCommand refuses exec-vector flags and the launchers that hide a head
 		"sed -n '1p' a.txt --f script.sed",
 		"sed -n '1p' a.txt --f=script.sed",
 		"sed -n '1p' a.txt --file=script.sed",
-		// `diff --paginate` pipes the diff through `pr`, a program from PATH.
+		// `diff --paginate` pipes the diff through `pr` (a hardcoded /usr/bin/pr), and `-l`
+		// is the documented short spelling of the same flag.
 		"diff --paginate a b",
 		"diff --pag a b",
+		"diff -l a b",
+		// `file -C` compiles a magic file and writes `<name>.mgc` beside it; the long
+		// spelling abbreviates like sed's, and `--C` folds onto `-C`.
+		"file -C -m magic",
+		"file -C -m magic a.txt",
+		"file --compile -m magic",
+		"file --comp -m magic",
+		"file --co -m magic",
+		"file --C -m magic",
 		// `uniq INPUT OUTPUT` writes its second positional argument.
 		"uniq u.txt u.out",
 		// git's `-O` / `--open-files-in-pager` hands the output to a command.
@@ -868,9 +884,17 @@ test("isSafeCommand refuses exec-vector flags and the launchers that hide a head
 	for (const command of [
 		"rg -n x .",
 		"rg -n --no-heading x .",
+		// A two-dash token that is not a single letter is not folded, and ripgrep rejects
+		// `--zz`/`--z=yes` itself (exit 2), so no decompressor runs.
+		"rg --zz x .",
+		"rg --z=yes x .",
 		"sort f",
 		"diff a b",
 		"diff -u a b",
+		// `file` keeps the read-only forms of the same command.
+		"file a.txt",
+		"file -m magic a.txt",
+		"file -c -m magic a.txt",
 		"npm audit",
 		"npm audit --json",
 		"npm audit --force",
