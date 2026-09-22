@@ -23,6 +23,7 @@ Pi core intentionally does not ship a built-in plan mode; this package provides 
 - Unlocks `write` and `edit` tools in Plan mode, but only for the plan file (`pi_plan.md`); all other file mutations are blocked.
 - Disables extension and custom tools by default, with a `/plan tools` selector for explicit user-risk opt-in; the exceptions that stay enabled by default are context management (`compress`, `decompress`, `search_context`, `acp_status` from billion-context-pi; `context_checkpoint`, `context_timeline`, `context_compact` from pi-context), read-only diagnostics (`lsp_diagnostics`), delegation (`push-task`, `resume-task` from pi-tree-like-subagent; `task-ask` stays opt-in — see the delegation note below), and read-only web access (`web_search`, `web_fetch`); everything else, including the mutating `lsp_fix`, stays opt-in.
 - Blocks mutating built-in tools and bash commands such as `rm`, `git commit`, dependency installs, redirects, and editor launches; the program names in that filter (`vim`, `bash`, `sudo`, …) and the file-mutating commands (`rm`, `mv`, `chmod`, …) count as command words only, so an argument, a path, or a search pattern that contains one (`cd ~/code && grep -rn x .`, `git log --grep=rm`) stays readable.
+- Verifies that filter at runtime: every shell call the command judge allows is snapshotted first, and anything the call changed is reported, marked as an error, and rolled back (`PI_PLAN_GUARD=off|detect|full`) — see [Two layers](#-two-layers-a-command-judge-and-a-runtime-write-guard).
 - Injects Codex-like Plan mode instructions: explore first, ask decision questions for high-impact ambiguity, do not mutate project files, and finish by writing the plan to `pi_plan.md` only when decision-complete.
 - Adds a required `plan_mode_question` tool so the agent can ask structured Plan-mode questions before finalizing a plan.
 - Detects when `pi_plan.md` appears or changes and prompts you to implement, stay in Plan mode, or exit and discard the plan.
@@ -128,16 +129,60 @@ This extension maps Codex's `ModeKind::Plan` behavior onto Pi's extension API:
 - The agent should use `plan_mode_question` for important non-discoverable preferences or tradeoffs before finalizing.
 - `update_plan`-style checklist use is discouraged while Plan mode is active.
 - The implementation boundary is explicit: Plan mode restores tools before starting implementation, choosing implementation immediately triggers a normal agent turn with full tool access, and plain exit/off keeps `pi_plan.md` on disk.
-- Pi extension safety is approximated with write restriction plus bash filtering, both keyed on the tool name: anything named `edit`/`write` may only touch `pi_plan.md` and anything named `bash` must pass the command allowlist, even when an extension provides it. Other non-built-in tools are user-selected at user risk because Plan mode does not classify extension/custom tool behavior.
+- Pi extension safety is approximated with write restriction plus bash filtering, both keyed on the tool name: anything named `edit`/`write` may only touch `pi_plan.md` and anything named `bash` must pass the command allowlist, even when an extension provides it. Other non-built-in tools are user-selected at user risk because Plan mode does not classify extension/custom tool behavior. An allowed shell call is additionally verified against the work tree afterwards by the runtime write guard.
+
+## 🛡️ Two layers: a command judge and a runtime write guard
+
+Plan mode refuses to write, and that promise is enforced twice — a text-level command judge cannot be perfect, so the extension does not rely on it alone:
+
+1. **The command judge** (`isSafeCommand` / `isSafePowerShellCommand` in `src/plan-mode.ts`) reads the command before it runs. It splits the command line the way the shell does, keeps every segment on an allowlist of read-only programs, and refuses what it cannot prove read-only: expansions, redirects, command substitution, unknown long options, program-shaped paths. A command the judge does not accept is blocked and never runs.
+2. **The runtime write guard** (`src/plan-guard.ts`) starts from the assumption that the judge can be wrong. For every shell call the judge *did* allow it snapshots the work tree, compares it after the call, and — when the call changed something — reports the paths, marks the tool result as an error, notifies you, and puts the files back.
+
+The guard is a second line, not a replacement: it sees file system changes only after the fact. It degrades a judge miss from a silent write in read-only mode to a detected, reported, rolled-back one.
+
+### What the guard does
+
+- Snapshots the whole git work tree above the working directory, not just that directory, including untracked files that `.gitignore` does not cover.
+- Restores the **pre-call** state: your uncommitted edits and untracked files come back with their own content instead of being reset to `HEAD`.
+- Never touches your staging area — snapshots run through the guard's own temporary index.
+- Serializes compare-and-restore, so two violating calls in one batch cannot interleave their rollbacks. The snapshots themselves are taken during preflight (pi preflights every sibling tool call before executing any sibling), which is what keeps a batch of two shell calls from deadlocking.
+- Cleans up: temporary indexes are removed on session shutdown, and a tool result that never arrives cannot keep a snapshot alive.
+
+Without git (no repository, or git missing) the guard falls back to an in-process content snapshot of the working directory: files up to 1 MiB, 32 MiB in total, at most 20000 entries. Paths outside that budget are still detected and reported as unrestorable, never silently ignored.
+
+### Configuration
+
+`PI_PLAN_GUARD` selects the strength:
+
+| Value | Behavior |
+| --- | --- |
+| `full` (default) | detect and roll back |
+| `detect` | detect and report, leave the changes in place |
+| `off` | no guard — the judge is the only layer |
+
+Any other value, a typo included, keeps `full`.
+
+### Honest limits
+
+- **File system only.** Network requests, spawned background processes, and anything a child process did while it ran are not reverted.
+- **Only calls the judge allowed.** A blocked command never runs, so there is nothing to verify; `edit`/`write` are restricted statically to `pi_plan.md` instead.
+- **Gitignored files are invisible** to the git backend: they are neither detected nor restored. The fallback snapshot skips the usual VCS and dependency directories for the same reason.
+- **Not a backup.** The fallback budget leaves large files detect-only, and submodule (gitlink) paths cannot be restored.
+- **Manual edits race with a rollback.** Editing a file by hand while a guarded command runs can be overwritten by the rollback; that case is not detected.
+- **Cost.** Each guarded call stages the whole work tree into a temporary index, and the snapshots leave unreferenced blobs in `.git/objects` until git's own garbage collection removes them.
 
 ## 🗂️ Package layout
 
 ```txt
 .
 ├── src/
-│   └── plan-mode.ts
+│   ├── plan-mode.ts
+│   └── plan-guard.ts
 ├── test/
 │   ├── plan-mode.test.ts
+│   ├── plan-guard.test.ts
+│   ├── plan-guard-integration.test.ts
+│   ├── git-fixture.ts
 │   └── support.ts
 ├── README.md
 ├── LICENSE

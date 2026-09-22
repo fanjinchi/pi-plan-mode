@@ -1,6 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
+import {
+	createPlanGuard,
+	type GuardHandle,
+	type GuardSettlement,
+	type PlanGuard,
+	resolveGuardMode,
+} from "./plan-guard.js";
 
 const STATE_ENTRY_TYPE = "plan-mode-state";
 const STATUS_KEY = "plan-mode";
@@ -403,6 +410,20 @@ export default function planMode(pi: ExtensionAPI) {
 	// One hint per handoff when a settle arrives without the completion marker,
 	// so the user learns why the plan is still on disk instead of silence.
 	let planDoneHintShown = false;
+	// Runtime write guard (plan-guard.ts): the judge predicts what a command does, the
+	// guard verifies what it did. Handles are keyed by tool call id and dropped on
+	// session shutdown, so an interrupted call cannot keep a snapshot alive.
+	const guardHandles = new Map<string, GuardHandle>();
+	let guard: PlanGuard | undefined;
+	let guardCwd: string | undefined;
+	function guardFor(cwd: string): PlanGuard {
+		if (guard === undefined || guardCwd !== cwd) {
+			guard?.dispose();
+			guard = createPlanGuard(cwd);
+			guardCwd = cwd;
+		}
+		return guard;
+	}
 
 	pi.registerFlag("plan", {
 		description: "Start in Codex-like Plan mode",
@@ -503,6 +524,10 @@ export default function planMode(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		persistState();
+		guardHandles.clear();
+		guard?.dispose();
+		guard = undefined;
+		guardCwd = undefined;
 		clearUi(ctx);
 	});
 
@@ -533,6 +558,35 @@ export default function planMode(pi: ExtensionAPI) {
 				reason: `Plan mode blocks mutating or non-allowlisted ${event.toolName} commands.\nCommand: ${command}`,
 			};
 		}
+
+		// The command passed the judge, so snapshot what it could change. Nothing may be
+		// held here until the call finishes: pi awaits every sibling preflight before it
+		// executes any sibling (pi-agent-core `executeToolCallsParallel`), so a lock taken
+		// in this handler would deadlock a batch of two shell calls. Serialization lives in
+		// settle(), which runs after execution.
+		if (typeof event.toolCallId !== "string" || event.toolCallId.length === 0) return;
+		if (resolveGuardMode(process.env.PI_PLAN_GUARD) === "off") return;
+		const handle = await guardFor(ctx.cwd).begin();
+		guardHandles.set(event.toolCallId, handle);
+	});
+
+	pi.on("tool_result", async (event, ctx) => {
+		if (typeof event.toolCallId !== "string") return;
+		const handle = guardHandles.get(event.toolCallId);
+		if (handle === undefined) return;
+		guardHandles.delete(event.toolCallId);
+		const settlement = await handle.settle();
+		if (settlement.changes.length === 0) return;
+		ctx.ui.notify(
+			`Plan mode guard: ${settlement.changes.length} path(s) changed by a read-only command${
+				settlement.restored.length > 0 ? `, ${settlement.restored.length} restored` : ""
+			}.`,
+			"warning",
+		);
+		return {
+			content: [...event.content, { type: "text", text: formatGuardReport(settlement, ctx.cwd) }],
+			isError: true,
+		};
 	});
 
 	pi.on("context", async (event, ctx) => {
@@ -2477,6 +2531,47 @@ function hasPathShapedHead(segment: string): boolean {
 function firstCommandWord(segment: string): string | undefined {
 	const match = /^\s*([A-Za-z_][A-Za-z0-9_+-]*)/.exec(segment);
 	return match?.[1]?.toLowerCase();
+}
+
+/**
+ * Report appended to the tool result of a guarded shell call that changed the working
+ * tree. The model reads this, not just the user: it has to learn that plan mode is
+ * read-only in practice, which files it touched, and what to do instead — otherwise the
+ * next turn simply repeats the same command.
+ */
+function formatGuardReport(settlement: GuardSettlement, cwd: string): string {
+	const relative = (absolute: string): string => {
+		const value = path.relative(cwd, absolute);
+		return value.length > 0 && !value.startsWith("..") ? value : absolute;
+	};
+	const summarize = (paths: string[]): string => {
+		const shown = paths.slice(0, 20).map(relative);
+		const extra = paths.length > shown.length ? `, +${paths.length - shown.length} more` : "";
+		return `${shown.join(", ")}${extra}`;
+	};
+	const headline =
+		settlement.mode === "detect"
+			? `Plan mode is read-only, but this command changed the working tree (PI_PLAN_GUARD=detect: reported, not restored).`
+			: settlement.unrestorable.length > 0
+				? `Plan mode is read-only, but this command changed the working tree; the guard restored what it could (PI_PLAN_GUARD=${settlement.mode}).`
+				: `Plan mode is read-only, but this command changed the working tree; the guard restored it (PI_PLAN_GUARD=${settlement.mode}).`;
+	const lines = [headline, ""];
+	for (const kind of ["created", "modified", "deleted"] as const) {
+		const paths = settlement.changes
+			.filter((change) => change.kind === kind)
+			.map((change) => change.path);
+		if (paths.length > 0) lines.push(`${kind}: ${summarize(paths)}`);
+	}
+	if (settlement.unrestorable.length > 0) {
+		lines.push(`NOT restored — check these by hand: ${summarize(settlement.unrestorable)}`);
+	}
+	for (const note of settlement.notes) lines.push(`Note: ${note}`);
+	lines.push(
+		"",
+		`Do not change the repository to explore it: put the design into ${PLAN_FILE_NAME} and present the plan, or leave plan mode (/plan) before editing files.`,
+		"Side effects outside the file system — network calls, spawned programs, anything a child process did — are not reverted by this guard.",
+	);
+	return lines.join("\n");
 }
 
 export function planFilePath(cwd: string): string {
