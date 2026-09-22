@@ -416,6 +416,10 @@ export default function planMode(pi: ExtensionAPI) {
 	const guardHandles = new Map<string, GuardHandle>();
 	let guard: PlanGuard | undefined;
 	let guardCwd: string | undefined;
+	// A degraded snapshot (a failed `git add`, an unreadable subtree, a skipped mode map)
+	// is reported once per session: the model gets the note on every affected call, but a
+	// warning that fires on every read command teaches the user to ignore warnings.
+	const notifiedGuardNotes = new Set<string>();
 	function guardFor(cwd: string): PlanGuard {
 		if (guard === undefined || guardCwd !== cwd) {
 			guard?.dispose();
@@ -513,6 +517,7 @@ export default function planMode(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		notifiedGuardNotes.clear();
 		restoreState(ctx);
 		if (pi.getFlag("plan") === true) state.enabled = true;
 		if (state.enabled) {
@@ -576,16 +581,34 @@ export default function planMode(pi: ExtensionAPI) {
 		if (handle === undefined) return;
 		guardHandles.delete(event.toolCallId);
 		const settlement = await handle.settle();
-		if (settlement.changes.length === 0) return;
-		ctx.ui.notify(
-			`Plan mode guard: ${settlement.changes.length} path(s) changed by a read-only command${
-				settlement.restored.length > 0 ? `, ${settlement.restored.length} restored` : ""
-			}.`,
-			"warning",
-		);
+		if (settlement.changes.length === 0 && settlement.notes.length === 0) return;
+		// A detected write is an error for the model: plan mode was supposed to be read-only.
+		// A mere note is not — the command itself may have run fine and its output is still
+		// valid — so the result keeps its status and only gains the report. Both reach the
+		// user; an identical degraded-verification note is shown once per session, since a
+		// warning on every read command would only teach the user to ignore it.
+		const changed = settlement.changes.length > 0;
+		if (changed) {
+			ctx.ui.notify(
+				`Plan mode guard: ${settlement.changes.length} path(s) changed by a read-only command${
+					settlement.restored.length > 0 ? `, ${settlement.restored.length} restored` : ""
+				}.`,
+				"warning",
+			);
+		} else {
+			const [first, ...rest] = settlement.notes;
+			const summary = `${first}${rest.length > 0 ? ` (+${rest.length} more note(s))` : ""}`;
+			if (!notifiedGuardNotes.has(summary)) {
+				notifiedGuardNotes.add(summary);
+				ctx.ui.notify(
+					`Plan mode guard: this command ran without full verification — ${summary}`,
+					"warning",
+				);
+			}
+		}
 		return {
 			content: [...event.content, { type: "text", text: formatGuardReport(settlement, ctx.cwd) }],
-			isError: true,
+			...(changed ? { isError: true } : {}),
 		};
 	});
 
@@ -2550,18 +2573,24 @@ function formatGuardReport(settlement: GuardSettlement, cwd: string): string {
 		return `${shown.join(", ")}${extra}`;
 	};
 	const headline =
-		settlement.mode === "detect"
-			? `Plan mode is read-only, but this command changed the working tree (PI_PLAN_GUARD=detect: reported, not restored).`
-			: settlement.unrestorable.length > 0
-				? `Plan mode is read-only, but this command changed the working tree; the guard restored what it could (PI_PLAN_GUARD=${settlement.mode}).`
-				: `Plan mode is read-only, but this command changed the working tree; the guard restored it (PI_PLAN_GUARD=${settlement.mode}).`;
+		settlement.changes.length === 0
+			? `Plan mode is read-only, but the runtime guard could not fully verify this command (PI_PLAN_GUARD=${settlement.mode}); the notes below say why. No change was found, and nothing proves that there was none.`
+			: settlement.mode === "detect"
+				? `Plan mode is read-only, but this command changed the working tree (PI_PLAN_GUARD=detect: reported, not restored).`
+				: settlement.unrestorable.length > 0
+					? `Plan mode is read-only, but this command changed the working tree; the guard restored what it could (PI_PLAN_GUARD=${settlement.mode}).`
+					: `Plan mode is read-only, but this command changed the working tree; the guard restored it (PI_PLAN_GUARD=${settlement.mode}).`;
 	const lines = [headline, ""];
 	for (const kind of ["created", "modified", "deleted"] as const) {
 		const paths = settlement.changes
-			.filter((change) => change.kind === kind)
+			.filter((change) => change.kind === kind && change.permissionOnly !== true)
 			.map((change) => change.path);
 		if (paths.length > 0) lines.push(`${kind}: ${summarize(paths)}`);
 	}
+	const permissionPaths = settlement.changes
+		.filter((change) => change.permissionOnly === true)
+		.map((change) => change.path);
+	if (permissionPaths.length > 0) lines.push(`permissions: ${summarize(permissionPaths)}`);
 	if (settlement.unrestorable.length > 0) {
 		lines.push(`NOT restored — check these by hand: ${summarize(settlement.unrestorable)}`);
 	}

@@ -21,6 +21,11 @@ import path from "node:path";
  * "compare and restore" step is serialized. Two concurrent violating calls can each see
  * the other's writes in their change set; both are violations, both rollbacks restore a
  * pre-call state, and the work tree converges to the state it had before the batch.
+ *
+ * Permission bits: git records only 0644/0755, and `checkout-index` writes files under the
+ * process umask, so a rollback that only replaced content would hand a 0600 secret back
+ * world-readable. The guard reads the real modes of its snapshot's paths before the call
+ * and puts them back afterwards (see captureWorkTreeModes).
  */
 export type GuardMode = "off" | "detect" | "full";
 
@@ -32,6 +37,8 @@ export interface GuardChange {
 	kind: GuardChangeKind;
 	/** False when the snapshot did not keep enough to put the path back. */
 	restorable: boolean;
+	/** True when only the permission bits moved: the content is unchanged. */
+	permissionOnly?: boolean;
 }
 
 export interface GuardSettlement {
@@ -71,6 +78,13 @@ const GIT_TIMEOUT_MS = 20000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 const GITLINK_MODE = "160000";
 const SYMLINK_MODE = "120000";
+/** The mode map costs one lstat per snapshot path; a larger tree is reported as degraded. */
+const MODE_MAP_LIMIT = 20000;
+const MODE_TYPE_MASK = 0o170000;
+const MODE_FILE_TYPE = 0o100000;
+const MODE_PERMISSION_MASK = 0o7777;
+/** No live guarded call holds its working directory for an hour. */
+const STALE_DIRECTORY_MS = 60 * 60 * 1000;
 
 /**
  * Directories the fallback snapshot does not descend into. They are either VCS
@@ -162,7 +176,7 @@ function pruneEmptyParents(root: string, target: string): void {
 function writeFileAtomic(target: string, content: Buffer, mode: number | undefined): void {
 	const temporary = `${target}.pi-plan-guard-${process.pid}-${Math.random().toString(36).slice(2)}`;
 	fs.writeFileSync(temporary, content);
-	if (mode !== undefined) fs.chmodSync(temporary, mode & 0o777);
+	if (mode !== undefined) fs.chmodSync(temporary, mode & MODE_PERMISSION_MASK);
 	fs.renameSync(temporary, target);
 }
 
@@ -260,12 +274,19 @@ function captureFileSnapshot(root: string): FileSnapshot {
 	return { entries, notes };
 }
 
-function fileEntryChanged(before: FileEntry, after: FileEntry): boolean {
+function fileContentChanged(before: FileEntry, after: FileEntry): boolean {
 	if (before.kind !== after.kind) return true;
 	if (before.kind === "symlink") return before.target !== after.target;
 	if (before.kind === "directory") return false;
 	if (before.hash !== undefined && after.hash !== undefined) return before.hash !== after.hash;
 	return before.size !== after.size || before.mtimeMs !== after.mtimeMs;
+}
+
+function fileEntryChanged(before: FileEntry, after: FileEntry): boolean {
+	if (fileContentChanged(before, after)) return true;
+	// A file whose content is identical but whose mode moved is still a write in plan mode:
+	// widening 0600 to 0644 is a real change, and the fallback snapshot can see it.
+	return (before.mode & MODE_PERMISSION_MASK) !== (after.mode & MODE_PERMISSION_MASK);
 }
 
 function restoreFilePaths(
@@ -286,6 +307,16 @@ function restoreFilePaths(
 		const previous = before.entries.get(absolute);
 		const current = after.entries.get(absolute);
 		try {
+			if (change.permissionOnly === true) {
+				// The content never moved, so putting the permission bits back is the repair.
+				if (previous === undefined || previous.kind !== "file") {
+					unrestorable.push(absolute);
+					continue;
+				}
+				fs.chmodSync(absolute, previous.mode & MODE_PERMISSION_MASK);
+				restored.push(absolute);
+				continue;
+			}
 			if (previous === undefined || change.kind === "created") {
 				// A path that did not exist before the call: remove whatever the command
 				// created there, including a directory tree that replaced nothing.
@@ -437,16 +468,137 @@ async function gitTreeEntries(
 	return entries;
 }
 
+async function gitIndexPaths(root: string, indexFile: string): Promise<string[] | undefined> {
+	const result = await gitRun(root, ["ls-files", "-z"], { GIT_INDEX_FILE: indexFile });
+	if (result.code !== 0) return undefined;
+	return result.stdout.split("\0").filter((file) => file.length > 0);
+}
+
+/**
+ * Reads the real permission bits of everything the snapshot covers. Git cannot answer
+ * this question: its index stores 100644/100755 only, so a 0600 file and a 0644 file look
+ * identical to `diff-tree`. Without this map a rollback would rewrite a 0600 secret under
+ * the process umask (0644 with the usual 022) and call it restored.
+ */
+async function captureWorkTreeModes(
+	root: string,
+	indexFile: string,
+): Promise<{ modes: Map<string, number>; note?: string }> {
+	const paths = await gitIndexPaths(root, indexFile);
+	if (paths === undefined) {
+		return {
+			modes: new Map(),
+			note: "Permission bits were not recorded for this call: the snapshot's path list was unavailable.",
+		};
+	}
+	if (paths.length > MODE_MAP_LIMIT) {
+		return {
+			modes: new Map(),
+			note: `Permission bits were not recorded for this call: the work tree has ${paths.length} entries (limit ${MODE_MAP_LIMIT}).`,
+		};
+	}
+	const modes = new Map<string, number>();
+	for (const file of paths) {
+		try {
+			modes.set(file, fs.lstatSync(path.resolve(root, file)).mode);
+		} catch {
+			// A path that vanished between `add` and this stat has no mode to restore.
+		}
+	}
+	return { modes };
+}
+
+/**
+ * Paths whose content is untouched but whose permission bits moved. `diff-tree` cannot
+ * report these (mode 100644 and 100755 only), so they are compared against the recorded
+ * map instead: a plain `chmod` is invisible to git and would otherwise never be reversed.
+ */
+function permissionOnlyPaths(
+	root: string,
+	changed: { path: string }[],
+	modes: Map<string, number>,
+): string[] {
+	if (modes.size === 0) return [];
+	const touched = new Set(changed.map((change) => change.path));
+	const moved: string[] = [];
+	for (const [file, mode] of modes) {
+		if (touched.has(file)) continue;
+		// Regular files only: chmod on a symlink would hit its target instead.
+		if ((mode & MODE_TYPE_MASK) !== MODE_FILE_TYPE) continue;
+		let current: number;
+		try {
+			current = fs.lstatSync(path.resolve(root, file)).mode;
+		} catch {
+			continue;
+		}
+		if ((current & MODE_PERMISSION_MASK) !== (mode & MODE_PERMISSION_MASK)) moved.push(file);
+	}
+	return moved;
+}
+
+/**
+ * A session that is killed cannot remove its own working directory, so creating a guard
+ * also drops directories old enough that no live call can still hold them (a guarded call
+ * keeps its directory for the duration of one command, not for an hour).
+ */
+function sweepStaleDirectories(): void {
+	let names: string[];
+	try {
+		names = fs.readdirSync(os.tmpdir());
+	} catch {
+		return;
+	}
+	const now = Date.now();
+	for (const name of names) {
+		if (!name.startsWith("pi-plan-guard-")) continue;
+		const candidate = path.join(os.tmpdir(), name);
+		try {
+			const stat = fs.statSync(candidate);
+			if (!stat.isDirectory() || now - stat.mtimeMs < STALE_DIRECTORY_MS) continue;
+			fs.rmSync(candidate, { recursive: true, force: true });
+		} catch {
+			// Another session may have removed it first, or it is not ours to remove.
+		}
+	}
+}
+
 export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): PlanGuard {
 	let temporaryDirectory: string | undefined;
 	let settleChain: Promise<unknown> = Promise.resolve();
 	let sequence = 0;
+	let disposed = false;
+	sweepStaleDirectories();
 
 	function tempDirectory(): string {
 		if (temporaryDirectory === undefined) {
-			temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plan-guard-"));
+			// The pid in the name lets a test, or a user staring at /tmp, tell which session a
+			// leftover directory belongs to.
+			temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), `pi-plan-guard-${process.pid}-`));
 		}
 		return temporaryDirectory;
+	}
+
+	/**
+	 * Temporary index files share one directory per guard, so dispose() drops them in one
+	 * step. A settle that arrives after dispose() (the extension moved to another working
+	 * directory) still runs, but it must not recreate a directory nothing would clean up:
+	 * its file lands directly in the temp directory and is removed when the settle is done.
+	 */
+	function allocateTempFile(label: string): string {
+		if (disposed) {
+			return path.join(os.tmpdir(), `pi-plan-guard-${process.pid}-${label}-${sequence++}.index`);
+		}
+		return path.join(tempDirectory(), `${label}.index`);
+	}
+
+	function removeTempFiles(...files: string[]): void {
+		for (const file of files) {
+			try {
+				fs.rmSync(file, { force: true });
+			} catch {
+				// dispose() removes the directory as a whole; a late file is retried here only.
+			}
+		}
 	}
 
 	// The settle lock is what keeps two rollbacks from interleaving. It is held only
@@ -466,62 +618,109 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 		beforeTree: string,
 		beforeEntries: Map<string, GitTreeEntry>,
 		changes: GuardChange[],
-	): Promise<{ restored: string[]; unrestorable: string[] }> {
+		modes: Map<string, number>,
+	): Promise<{ restored: string[]; unrestorable: string[]; notes: string[] }> {
 		const restored: string[] = [];
 		const unrestorable: string[] = [];
-		const indexFile = path.join(tempDirectory(), `restore-${sequence++}.index`);
-		const env = { GIT_INDEX_FILE: indexFile };
-		const reload = await gitRun(root, ["read-tree", beforeTree], env);
-		if (reload.code !== 0) {
-			for (const change of changes) unrestorable.push(change.path);
-			return { restored, unrestorable };
-		}
-		const toCheckout: string[] = [];
-		for (const change of changes) {
-			const absolute = path.resolve(root, change.path);
-			const previous = beforeEntries.get(change.path);
-			if (previous === undefined) {
-				try {
-					fs.rmSync(absolute, { recursive: true, force: true });
-					pruneEmptyParents(root, absolute);
-					restored.push(absolute);
-				} catch {
-					unrestorable.push(absolute);
-				}
-				continue;
-			}
-			if (previous.mode === GITLINK_MODE) {
-				unrestorable.push(absolute);
-				continue;
-			}
-			if (previous.mode !== SYMLINK_MODE) {
-				try {
-					// A directory tree where a file used to be blocks `checkout-index`.
-					if (fs.existsSync(absolute) && fs.statSync(absolute).isDirectory()) {
-						fs.rmSync(absolute, { recursive: true, force: true });
-					}
-					fs.mkdirSync(path.dirname(absolute), { recursive: true });
-				} catch {
-					// checkout-index reports the final failure below.
-				}
-			}
-			toCheckout.push(change.path);
-		}
-		for (let index = 0; index < toCheckout.length; index += RESTORE_BATCH_SIZE) {
-			const batch = toCheckout.slice(index, index + RESTORE_BATCH_SIZE);
-			const checkedOut = await gitRun(root, ["checkout-index", "-f", "--", ...batch], env);
-			for (const file of batch) {
-				const absolute = path.resolve(root, file);
-				if (checkedOut.code === 0 && fs.existsSync(absolute)) restored.push(absolute);
-				else unrestorable.push(absolute);
-			}
-		}
+		const notes: string[] = [];
+		const indexFile = allocateTempFile(`restore-${sequence++}`);
 		try {
-			fs.rmSync(indexFile, { force: true });
-		} catch {
-			// Temporary index files are also removed by dispose().
+			const env = { GIT_INDEX_FILE: indexFile };
+			const reload = await gitRun(root, ["read-tree", beforeTree], env);
+			if (reload.code !== 0) {
+				for (const change of changes) unrestorable.push(change.path);
+				return { restored, unrestorable, notes };
+			}
+			const toCheckout: string[] = [];
+			const permissionOnly: string[] = [];
+			for (const change of changes) {
+				const absolute = path.resolve(root, change.path);
+				const previous = beforeEntries.get(change.path);
+				if (change.permissionOnly === true) {
+					// The content never moved, so putting the permission bits back is the repair.
+					if (previous === undefined) unrestorable.push(absolute);
+					else permissionOnly.push(change.path);
+					continue;
+				}
+				if (previous === undefined) {
+					try {
+						fs.rmSync(absolute, { recursive: true, force: true });
+						pruneEmptyParents(root, absolute);
+						restored.push(absolute);
+					} catch {
+						unrestorable.push(absolute);
+					}
+					continue;
+				}
+				if (previous.mode === GITLINK_MODE) {
+					unrestorable.push(absolute);
+					continue;
+				}
+				if (previous.mode !== SYMLINK_MODE) {
+					try {
+						// A directory tree where a file used to be blocks `checkout-index`.
+						if (fs.existsSync(absolute) && fs.statSync(absolute).isDirectory()) {
+							fs.rmSync(absolute, { recursive: true, force: true });
+						}
+						fs.mkdirSync(path.dirname(absolute), { recursive: true });
+					} catch {
+						// checkout-index reports the final failure below.
+					}
+				}
+				toCheckout.push(change.path);
+			}
+			const checkedOut = new Set<string>();
+			for (let index = 0; index < toCheckout.length; index += RESTORE_BATCH_SIZE) {
+				const batch = toCheckout.slice(index, index + RESTORE_BATCH_SIZE);
+				const result = await gitRun(root, ["checkout-index", "-f", "--", ...batch], env);
+				for (const file of batch) {
+					const absolute = path.resolve(root, file);
+					if (result.code === 0 && fs.existsSync(absolute)) {
+						checkedOut.add(file);
+						restored.push(absolute);
+					} else unrestorable.push(absolute);
+				}
+			}
+			// `checkout-index` writes content under the process umask, so the recorded mode is
+			// applied afterwards — and read back, because a chmod that silently did not stick
+			// must not be reported as a restore.
+			const permissionOnlySet = new Set(permissionOnly);
+			const failedModes: string[] = [];
+			for (const file of [...checkedOut, ...permissionOnly]) {
+				const absolute = path.resolve(root, file);
+				const recorded = modes.get(file);
+				// Regular files only: chmod on a symlink would change its target instead.
+				if (recorded === undefined || (recorded & MODE_TYPE_MASK) !== MODE_FILE_TYPE) {
+					if (permissionOnlySet.has(file)) {
+						unrestorable.push(absolute);
+						notes.push(
+							`Could not restore the permission bits of ${absolute}: no mode was recorded for it.`,
+						);
+					}
+					continue;
+				}
+				const wanted = recorded & MODE_PERMISSION_MASK;
+				try {
+					if ((fs.lstatSync(absolute).mode & MODE_PERMISSION_MASK) !== wanted) {
+						fs.chmodSync(absolute, wanted);
+					}
+					if ((fs.lstatSync(absolute).mode & MODE_PERMISSION_MASK) !== wanted) {
+						failedModes.push(absolute);
+					} else if (permissionOnlySet.has(file)) {
+						restored.push(absolute);
+					}
+				} catch {
+					failedModes.push(absolute);
+				}
+			}
+			for (const absolute of failedModes) {
+				if (!unrestorable.includes(absolute)) unrestorable.push(absolute);
+				notes.push(`Could not restore the permission bits of ${absolute}.`);
+			}
+			return { restored, unrestorable, notes };
+		} finally {
+			removeTempFiles(indexFile);
 		}
-		return { restored, unrestorable };
 	}
 
 	return {
@@ -563,10 +762,13 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 										restorable: entry.kind !== "directory",
 									});
 								} else if (fileEntryChanged(previous, entry)) {
+									const permissionOnly = !fileContentChanged(previous, entry);
 									changes.push({
 										path: absolute,
 										kind: "modified",
-										restorable: previous.kind !== "file" || previous.content !== undefined,
+										restorable:
+											permissionOnly || previous.kind !== "file" || previous.content !== undefined,
+										permissionOnly,
 									});
 								}
 							}
@@ -578,7 +780,12 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 									restorable: entry.kind !== "file" || entry.content !== undefined,
 								});
 							}
-							const notes = [...snapshot.notes];
+							// Notes from the re-read matter as much as the snapshot's: a subtree that could
+							// not be read after the call was never compared, and silence would claim it was.
+							const notes = [
+								...snapshot.notes,
+								...after.notes.map((note) => `After the call: ${note}`),
+							];
 							const { restored, unrestorable } = restoreFilePaths(
 								mode,
 								cwd,
@@ -586,15 +793,18 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 								after,
 								changes,
 							);
-							notes.push(...snapshot.notes.filter((note) => !notes.includes(note)));
+							for (const note of snapshot.notes) {
+								if (!notes.includes(note)) notes.push(note);
+							}
 							return { mode, changes, restored, unrestorable, notes };
 						}),
 				};
 			}
-			const indexFile = path.join(tempDirectory(), `pre-${sequence++}.index`);
+			const indexFile = allocateTempFile(`pre-${sequence++}`);
 			const seed = await gitUserIndexPath(root);
 			const beforeTree = await gitCapture(root, indexFile, seed);
 			if (beforeTree === undefined) {
+				removeTempFiles(indexFile);
 				return {
 					settle: async () =>
 						emptySettlement(mode, [
@@ -602,90 +812,107 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 						]),
 				};
 			}
+			// The real permission bits live nowhere git can see them, so they are read here,
+			// before the command runs (see captureWorkTreeModes).
+			const modes = await captureWorkTreeModes(root, indexFile);
 			return {
 				settle: async () =>
 					withSettleLock(async () => {
 						await options.duringSettle?.();
-						const postIndex = path.join(tempDirectory(), `post-${sequence++}.index`);
-						const afterTree = await gitCapture(root, postIndex, indexFile);
-						if (afterTree === undefined) {
-							return emptySettlement(mode, [
-								`Could not re-read the git work tree at ${root}; this call was not checked.`,
-							]);
-						}
-						const changed = await gitChangedPaths(root, beforeTree, afterTree);
-						if (changed === undefined) {
-							return emptySettlement(mode, [
-								`Could not diff the git work tree at ${root}; this call was not checked.`,
-							]);
-						}
-						const beforeEntries = await gitTreeEntries(root, beforeTree);
-						const changes: GuardChange[] = changed.map((change) => ({
-							path: change.path,
-							kind: change.kind,
-							restorable: beforeEntries?.get(change.path)?.mode !== GITLINK_MODE,
-						}));
-						if (changes.length === 0) {
-							for (const file of [indexFile, postIndex]) {
-								try {
-									fs.rmSync(file, { force: true });
-								} catch {
-									// dispose() cleans up whatever is left.
+						const postIndex = allocateTempFile(`post-${sequence++}`);
+						const verifyIndex = allocateTempFile(`verify-${sequence++}`);
+						const notes: string[] = modes.note === undefined ? [] : [modes.note];
+						try {
+							const afterTree = await gitCapture(root, postIndex, indexFile);
+							if (afterTree === undefined) {
+								return emptySettlement(mode, [
+									...notes,
+									`Could not re-read the git work tree at ${root}; this call was not checked.`,
+								]);
+							}
+							const changed = await gitChangedPaths(root, beforeTree, afterTree);
+							if (changed === undefined) {
+								return emptySettlement(mode, [
+									...notes,
+									`Could not diff the git work tree at ${root}; this call was not checked.`,
+								]);
+							}
+							const beforeEntries = await gitTreeEntries(root, beforeTree);
+							const changes: GuardChange[] = [
+								...changed.map((change) => ({
+									path: change.path,
+									kind: change.kind,
+									restorable: beforeEntries?.get(change.path)?.mode !== GITLINK_MODE,
+								})),
+								// A plain chmod moves no content, so diff-tree cannot report it; the modes
+								// recorded before the call can.
+								...permissionOnlyPaths(root, changed, modes.modes).map((file) => ({
+									path: file,
+									kind: "modified" as const,
+									restorable: true,
+									permissionOnly: true,
+								})),
+							];
+							if (changes.length === 0) {
+								return { mode, changes, restored: [], unrestorable: [], notes };
+							}
+							if (mode !== "full") {
+								return {
+									mode,
+									changes,
+									restored: [],
+									unrestorable: changes
+										.filter((change) => !change.restorable)
+										.map((change) => change.path),
+									notes,
+								};
+							}
+							const restoral = await gitRestore(
+								root,
+								beforeTree,
+								beforeEntries ?? new Map(),
+								changes,
+								modes.modes,
+							);
+							notes.push(...restoral.notes);
+							// Re-read once to prove the work tree matches the snapshot again; a
+							// guard that claims to have restored and did not is worse than no guard.
+							const verifiedTree = await gitCapture(root, verifyIndex, postIndex);
+							if (verifiedTree !== undefined && verifiedTree !== beforeTree) {
+								const remaining = await gitChangedPaths(root, beforeTree, verifiedTree);
+								if (remaining !== undefined && remaining.length > 0) {
+									notes.push(
+										`${remaining.length} path(s) still differ from the snapshot after restoring.`,
+									);
+									for (const entry of remaining) {
+										const absolute = path.resolve(root, entry.path);
+										if (!restoral.unrestorable.includes(absolute)) {
+											restoral.unrestorable.push(absolute);
+										}
+									}
 								}
 							}
-							return { mode, changes, restored: [], unrestorable: [], notes: [] };
-						}
-						if (mode !== "full") {
 							return {
 								mode,
 								changes,
-								restored: [],
-								unrestorable: changes
-									.filter((change) => !change.restorable)
-									.map((change) => change.path),
-								notes: [],
+								restored: restoral.restored,
+								unrestorable: restoral.unrestorable,
+								notes,
 							};
+						} finally {
+							removeTempFiles(indexFile, postIndex, verifyIndex);
 						}
-						const { restored, unrestorable } = await gitRestore(
-							root,
-							beforeTree,
-							beforeEntries ?? new Map(),
-							changes,
-						);
-						const notes: string[] = [];
-						// Re-read once to prove the work tree matches the snapshot again; a
-						// guard that claims to have restored and did not is worse than no guard.
-						const verifyIndex = path.join(tempDirectory(), `verify-${sequence++}.index`);
-						const verifiedTree = await gitCapture(root, verifyIndex, postIndex);
-						if (verifiedTree !== undefined && verifiedTree !== beforeTree) {
-							const remaining = await gitChangedPaths(root, beforeTree, verifiedTree);
-							if (remaining !== undefined && remaining.length > 0) {
-								notes.push(
-									`${remaining.length} path(s) still differ from the snapshot after restoring.`,
-								);
-								for (const entry of remaining) {
-									const absolute = path.resolve(root, entry.path);
-									if (!unrestorable.includes(absolute)) unrestorable.push(absolute);
-								}
-							}
-						}
-						for (const file of [indexFile, postIndex, verifyIndex]) {
-							try {
-								fs.rmSync(file, { force: true });
-							} catch {
-								// dispose() cleans up whatever is left.
-							}
-						}
-						return { mode, changes, restored, unrestorable, notes };
 					}),
 			};
 		},
 		dispose(): void {
+			disposed = true;
 			if (temporaryDirectory === undefined) return;
 			try {
 				fs.rmSync(temporaryDirectory, { recursive: true, force: true });
 			} catch {
-				// Nothing to do: the directory lives in the OS temp dir.
+				// Nothing to do: the directory lives in the OS temp dir, and the stale-directory
+				// sweep of the next guard picks it up if this session is killed here.
 			}
 			temporaryDirectory = undefined;
 		},

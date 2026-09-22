@@ -138,6 +138,8 @@ Plan mode refuses to write, and that promise is enforced twice — a text-level 
 1. **The command judge** (`isSafeCommand` / `isSafePowerShellCommand` in `src/plan-mode.ts`) reads the command before it runs. It splits the command line the way the shell does, keeps every segment on an allowlist of read-only programs, and refuses what it cannot prove read-only: expansions, redirects, command substitution, unknown long options, program-shaped paths. A command the judge does not accept is blocked and never runs.
 2. **The runtime write guard** (`src/plan-guard.ts`) starts from the assumption that the judge can be wrong. For every shell call the judge *did* allow it snapshots the work tree, compares it after the call, and — when the call changed something — reports the paths, marks the tool result as an error, notifies you, and puts the files back.
 
+- **Reports what it could not verify.** A snapshot that failed, a comparison that could not run, a restore that read nothing back, a work tree larger than the mode map: those notes are appended to the tool result and shown as a warning instead of being dropped. `isError` marks a call that *changed* something; a call that merely could not be verified is reported without failing the tool result.
+
 The guard is a second line, not a replacement: it sees file system changes only after the fact. It degrades a judge miss from a silent write in read-only mode to a detected, reported, rolled-back one.
 
 ### What the guard does
@@ -145,8 +147,8 @@ The guard is a second line, not a replacement: it sees file system changes only 
 - Snapshots the whole git work tree above the working directory, not just that directory, including untracked files that `.gitignore` does not cover.
 - Restores the **pre-call** state: your uncommitted edits and untracked files come back with their own content instead of being reset to `HEAD`.
 - Never touches your staging area — snapshots run through the guard's own temporary index.
-- Serializes compare-and-restore, so two violating calls in one batch cannot interleave their rollbacks. The snapshots themselves are taken during preflight (pi preflights every sibling tool call before executing any sibling), which is what keeps a batch of two shell calls from deadlocking.
-- Cleans up: temporary indexes are removed on session shutdown, and a tool result that never arrives cannot keep a snapshot alive.
+- Serializes compare-and-restore: rollbacks never interleave. Calls in one batch still overlap, so the rollback of one call can run while a sibling call is still executing. The snapshots themselves are taken during preflight (pi preflights every sibling tool call before executing any sibling), which is what keeps a batch of two shell calls from deadlocking.
+- Cleans up: temporary indexes are removed as soon as a call settles, and everything left over is removed on session shutdown — a tool result that never arrives is dropped at session shutdown. Directories left behind by a killed process are tagged with their process id and swept once they are older than an hour.
 
 Without git (no repository, or git missing) the guard falls back to an in-process content snapshot of the working directory: files up to 1 MiB, 32 MiB in total, at most 20000 entries. Paths outside that budget are still detected and reported as unrestorable, never silently ignored.
 
@@ -166,7 +168,10 @@ Any other value, a typo included, keeps `full`.
 
 - **File system only.** Network requests, spawned background processes, and anything a child process did while it ran are not reverted.
 - **Only calls the judge allowed.** A blocked command never runs, so there is nothing to verify; `edit`/`write` are restricted statically to `pi_plan.md` instead.
-- **Gitignored files are invisible** to the git backend: they are neither detected nor restored. The fallback snapshot skips the usual VCS and dependency directories for the same reason.
+- **Gitignored files are invisible** to the git backend: they are neither detected nor restored. The same holds for paths outside the work tree above the working directory (a command can write to `/tmp`), for files marked `assume-unchanged` or `skip-worktree`, and for anything inside `.git/` itself. The fallback snapshot skips the usual VCS and dependency directories for the same reason.
+- **Directories are not tracked.** git does not record empty directories, so creating or deleting one is not reported and a directory a call removed is not recreated.
+- **Permissions** are restored from what the guard captured when the call started: content plus permission bits, execute bit included, applied without the umask of the current process, so a `chmod` that changes nothing else is reported as a permission-only change. Modes of paths the guard never captured — a file the call created, or any path beyond the 20000-entry mode map — are not restored.
+- **Repository filters run.** Snapshotting stages the work tree through a temporary index and restoring reads it back, so configured `clean`/`smudge` filters (like the `diff` textconv programs in the judge above) execute as part of the guard's own bookkeeping. A filter that writes files is a write the guard cannot tell apart from the command's own.
 - **Not a backup.** The fallback budget leaves large files detect-only, and submodule (gitlink) paths cannot be restored.
 - **Manual edits race with a rollback.** Editing a file by hand while a guarded command runs can be overwritten by the rollback; that case is not detected.
 - **Cost.** Each guarded call stages the whole work tree into a temporary index, and the snapshots leave unreferenced blobs in `.git/objects` until git's own garbage collection removes them.

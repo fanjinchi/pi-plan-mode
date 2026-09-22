@@ -12,6 +12,13 @@ type ToolResultPatch = {
 	isError?: boolean;
 };
 
+/** Directories this test process itself created, so a concurrent test file cannot interfere. */
+function ownGuardDirectories(): string[] {
+	return fs
+		.readdirSync(os.tmpdir())
+		.filter((name) => name.startsWith(`pi-plan-guard-${process.pid}-`));
+}
+
 async function setupPlanMode(options: {
 	cwd: string;
 	enabled: boolean;
@@ -20,6 +27,8 @@ async function setupPlanMode(options: {
 	mock: ReturnType<typeof createMockPi>;
 	ctx: never;
 	notifications: Array<{ message: string; level?: string }>;
+	/** Runs the session_shutdown handlers, i.e. exactly what pi does when the session ends. */
+	shutdown: () => Promise<void>;
 }> {
 	const mock = createMockPi({
 		activeTools: options.activeTools ?? ["read", "bash"],
@@ -36,7 +45,10 @@ async function setupPlanMode(options: {
 		},
 	});
 	for (const handler of mock.events.get("session_start") ?? []) await handler({}, ctx);
-	return { mock, ctx, notifications };
+	const shutdown = async (): Promise<void> => {
+		for (const handler of mock.events.get("session_shutdown") ?? []) await handler({}, ctx);
+	};
+	return { mock, ctx, notifications, shutdown };
 }
 
 async function preflightToolCall(
@@ -77,7 +89,11 @@ test("an allowed shell command that writes is rolled back and reported to the mo
 	const directory = createGitRepository();
 	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
 	withGuardMode(t, "full");
-	const { mock, ctx, notifications } = await setupPlanMode({ cwd: directory, enabled: true });
+	const { mock, ctx, notifications, shutdown } = await setupPlanMode({
+		cwd: directory,
+		enabled: true,
+	});
+	t.after(() => shutdown());
 
 	// The command passes the static judge, which is the only reason the guard exists.
 	const verdict = await preflightToolCall(mock, ctx, {
@@ -109,7 +125,8 @@ test("PI_PLAN_GUARD=detect reports the change without reverting it", async (t) =
 	const directory = createGitRepository();
 	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
 	withGuardMode(t, "detect");
-	const { mock, ctx } = await setupPlanMode({ cwd: directory, enabled: true });
+	const { mock, ctx, shutdown } = await setupPlanMode({ cwd: directory, enabled: true });
+	t.after(() => shutdown());
 
 	await preflightToolCall(mock, ctx, {
 		toolName: "bash",
@@ -130,7 +147,8 @@ test("PI_PLAN_GUARD=off leaves the shell path exactly as it was", async (t) => {
 	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "plan-guard-int-off-"));
 	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
 	withGuardMode(t, "off");
-	const { mock, ctx } = await setupPlanMode({ cwd: directory, enabled: true });
+	const { mock, ctx, shutdown } = await setupPlanMode({ cwd: directory, enabled: true });
+	t.after(() => shutdown());
 
 	await preflightToolCall(mock, ctx, {
 		toolName: "bash",
@@ -148,6 +166,7 @@ test("the guard stays out of the way when plan mode is off or the call was block
 	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
 
 	const inactive = await setupPlanMode({ cwd: directory, enabled: false });
+	t.after(() => inactive.shutdown());
 	await preflightToolCall(inactive.mock, inactive.ctx, {
 		toolName: "bash",
 		toolCallId: "call-inactive",
@@ -161,6 +180,7 @@ test("the guard stays out of the way when plan mode is off or the call was block
 	assert.equal(fs.existsSync(path.join(directory, "inactive.txt")), true);
 
 	const active = await setupPlanMode({ cwd: directory, enabled: true });
+	t.after(() => active.shutdown());
 	const blocked = (await preflightToolCall(active.mock, active.ctx, {
 		toolName: "bash",
 		toolCallId: "call-blocked",
@@ -179,7 +199,8 @@ test("a call without a tool call id is never snapshotted", async (t) => {
 	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "plan-guard-int-noid-"));
 	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
 	withGuardMode(t, "full");
-	const { mock, ctx } = await setupPlanMode({ cwd: directory, enabled: true });
+	const { mock, ctx, shutdown } = await setupPlanMode({ cwd: directory, enabled: true });
+	t.after(() => shutdown());
 
 	await preflightToolCall(mock, ctx, { toolName: "bash", input: { command: "ls" } });
 	fs.writeFileSync(path.join(directory, "untracked-write.txt"), "written\n");
@@ -192,17 +213,126 @@ test("session shutdown drops snapshots whose tool result never arrived", async (
 	const directory = createGitRepository();
 	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
 	withGuardMode(t, "full");
-	const { mock, ctx } = await setupPlanMode({ cwd: directory, enabled: true });
+	const { mock, ctx, shutdown } = await setupPlanMode({ cwd: directory, enabled: true });
 
 	await preflightToolCall(mock, ctx, {
 		toolName: "bash",
 		toolCallId: "call-interrupted",
 		input: { command: "git status --short" },
 	});
-	for (const handler of mock.events.get("session_shutdown") ?? []) await handler({}, ctx);
+	await shutdown();
 
 	// A result that arrives after the session is gone must not roll anything back.
 	fs.writeFileSync(path.join(directory, "tracked.txt"), "after shutdown\n");
 	assert.equal(await deliverToolResult(mock, ctx, { toolCallId: "call-interrupted" }), undefined);
 	assert.equal(fs.readFileSync(path.join(directory, "tracked.txt"), "utf8"), "after shutdown\n");
+});
+
+test("a snapshot that could not be taken is reported, never silently skipped", async (t) => {
+	if (!hasGit()) return t.skip("git is not available");
+	const directory = createGitRepository();
+	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+	withGuardMode(t, "full");
+	const { mock, ctx, notifications, shutdown } = await setupPlanMode({
+		cwd: directory,
+		enabled: true,
+	});
+	t.after(() => shutdown());
+
+	// A work tree the guard cannot snapshot. The command still runs, so the one thing that
+	// must not happen is silence: the user and the model both learn there was no safety net.
+	fs.writeFileSync(path.join(directory, ".git", "index"), "not an index");
+
+	const verdict = await preflightToolCall(mock, ctx, {
+		toolName: "bash",
+		toolCallId: "call-unverified",
+		input: { command: "git status --short" },
+	});
+	assert.equal(verdict, undefined, "the judge still allows the command");
+
+	const patch = await deliverToolResult(mock, ctx, { toolCallId: "call-unverified" });
+	assert.notEqual(patch, undefined, "the model is told that nothing verified this call");
+	assert.equal(
+		patch?.isError,
+		undefined,
+		"the command itself was fine, so its result keeps its status",
+	);
+	const text = (patch?.content ?? []).map((block) => block.text).join("\n");
+	assert.match(text, /could not fully verify this command/);
+	assert.match(text, /Could not snapshot the git work tree/);
+	assert.equal(notifications.length, 1, "the user is warned once");
+	assert.match(notifications[0]?.message ?? "", /without full verification/);
+	assert.match(notifications[0]?.message ?? "", /Could not snapshot/);
+});
+
+test("a note that arrives next to a real change keeps the error status", async (t) => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "plan-guard-int-notes-"));
+	const sealed = path.join(directory, "sealed");
+	fs.mkdirSync(sealed);
+	fs.chmodSync(sealed, 0o000);
+	t.after(() => {
+		try {
+			fs.chmodSync(sealed, 0o700);
+		} catch {
+			// Already gone with the directory below.
+		}
+		fs.rmSync(directory, { recursive: true, force: true });
+	});
+	withGuardMode(t, "full");
+	const { mock, ctx, notifications, shutdown } = await setupPlanMode({
+		cwd: directory,
+		enabled: true,
+	});
+	t.after(() => shutdown());
+
+	// Without git the guard falls back to the content snapshot, which cannot read this
+	// subtree: that is a note. The write to written.txt is a violation. Both must survive.
+	await preflightToolCall(mock, ctx, {
+		toolName: "bash",
+		toolCallId: "call-notes-and-changes",
+		input: { command: "ls" },
+	});
+	fs.writeFileSync(path.join(directory, "written.txt"), "command wrote\n");
+
+	const patch = await deliverToolResult(mock, ctx, { toolCallId: "call-notes-and-changes" });
+	assert.equal(patch?.isError, true, "a detected write is still an error");
+	const text = (patch?.content ?? []).map((block) => block.text).join("\n");
+	assert.match(text, /created: written\.txt/);
+	assert.match(text, /Note: .*sealed/);
+	assert.equal(fs.existsSync(path.join(directory, "written.txt")), false);
+	assert.equal(notifications.length, 1);
+	assert.match(notifications[0]?.message ?? "", /1 path\(s\) changed/);
+});
+
+test("a rolled back file keeps the permissions it had before the call", async (t) => {
+	if (!hasGit()) return t.skip("git is not available");
+	const directory = createGitRepository();
+	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+	withGuardMode(t, "full");
+	const { mock, ctx, shutdown } = await setupPlanMode({ cwd: directory, enabled: true });
+	t.after(() => shutdown());
+	const secret = path.join(directory, "secret.env");
+	fs.writeFileSync(secret, "secret\n");
+	fs.chmodSync(secret, 0o600);
+
+	await preflightToolCall(mock, ctx, {
+		toolName: "bash",
+		toolCallId: "call-mode",
+		input: { command: "git status --short" },
+	});
+	fs.writeFileSync(secret, "leaked\n");
+	fs.chmodSync(secret, 0o666);
+
+	const patch = await deliverToolResult(mock, ctx, { toolCallId: "call-mode" });
+	assert.equal(patch?.isError, true);
+	assert.equal(fs.readFileSync(secret, "utf8"), "secret\n");
+	assert.equal(
+		fs.statSync(secret).mode & 0o7777,
+		0o600,
+		"the rollback does not widen permissions through the umask",
+	);
+});
+
+test("no guard directory of this process survives the suite", () => {
+	assert.deepEqual(ownGuardDirectories(), [], "every guarded call disposes its working directory");
 });

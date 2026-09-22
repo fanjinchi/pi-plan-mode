@@ -261,3 +261,136 @@ test("a rollback does not leak into the change set of a call that started earlie
 	assert.equal(fs.existsSync(path.join(directory, "added-by-second.txt")), false);
 	guard.dispose();
 });
+
+test("a rollback puts the permission bits back and a bare chmod is a change", async (t) => {
+	if (!hasGit()) return t.skip("git is not available");
+	const directory = createGitRepository();
+	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+	const secret = path.join(directory, "secret.env");
+	const script = path.join(directory, "run.sh");
+	const privateFile = path.join(directory, "private.txt");
+	fs.writeFileSync(secret, "secret\n");
+	fs.chmodSync(secret, 0o600);
+	fs.writeFileSync(script, "#!/bin/sh\n");
+	fs.chmodSync(script, 0o700);
+	fs.writeFileSync(privateFile, "keep\n");
+	fs.chmodSync(privateFile, 0o640);
+
+	const guard = createPlanGuard(directory);
+	const handle = await guard.begin();
+	// What a missed judgement would have done: content, content plus permissions, and a
+	// bare chmod that never touches a byte.
+	fs.writeFileSync(secret, "leaked\n");
+	fs.chmodSync(secret, 0o666);
+	fs.writeFileSync(script, "tampered\n");
+	fs.chmodSync(script, 0o777);
+	fs.chmodSync(privateFile, 0o644);
+
+	const settlement = await handle.settle();
+	const changes = changedNames(settlement);
+	assert.equal(changes.get("secret.env")?.kind, "modified");
+	assert.equal(changes.get("run.sh")?.kind, "modified");
+	assert.equal(
+		changes.get("private.txt")?.kind,
+		"modified",
+		"a chmod with unchanged content is still a write",
+	);
+	assert.equal(
+		settlement.changes.find((change) => change.path.endsWith("private.txt"))?.permissionOnly,
+		true,
+	);
+	assert.equal(fs.readFileSync(secret, "utf8"), "secret\n");
+	assert.equal(
+		fs.statSync(secret).mode & 0o7777,
+		0o600,
+		"a 0600 secret does not come back world-readable",
+	);
+	assert.equal(fs.statSync(script).mode & 0o7777, 0o700);
+	assert.equal(fs.statSync(privateFile).mode & 0o7777, 0o640);
+	assert.deepEqual(settlement.unrestorable, []);
+	assert.deepEqual(settlement.notes, []);
+	guard.dispose();
+});
+
+test("without git the content snapshot restores permission bits too", async (t) => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "plan-guard-files-mode-"));
+	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+	const secret = path.join(directory, "secret.env");
+	const privateFile = path.join(directory, "private.txt");
+	fs.writeFileSync(secret, "secret\n");
+	fs.chmodSync(secret, 0o600);
+	fs.writeFileSync(privateFile, "keep\n");
+	fs.chmodSync(privateFile, 0o640);
+
+	const guard = createPlanGuard(directory);
+	const handle = await guard.begin();
+	fs.writeFileSync(secret, "leaked\n");
+	fs.chmodSync(secret, 0o666);
+	fs.chmodSync(privateFile, 0o644);
+
+	const settlement = await handle.settle();
+	assert.equal(fs.readFileSync(secret, "utf8"), "secret\n");
+	assert.equal(fs.statSync(secret).mode & 0o7777, 0o600);
+	assert.equal(fs.statSync(privateFile).mode & 0o7777, 0o640);
+	assert.equal(
+		settlement.changes.find((change) => change.path.endsWith("private.txt"))?.permissionOnly,
+		true,
+	);
+	assert.deepEqual(settlement.unrestorable, []);
+	guard.dispose();
+});
+
+test("a stale guard directory is swept while a live one is left alone", async (t) => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "plan-guard-sweep-"));
+	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+	const stale = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plan-guard-stale-"));
+	const live = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plan-guard-live-"));
+	t.after(() => fs.rmSync(live, { recursive: true, force: true }));
+	fs.writeFileSync(path.join(stale, "pre-0.index"), "debris from a killed session");
+	const longAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+	fs.utimesSync(stale, longAgo, longAgo);
+
+	const guard = createPlanGuard(directory);
+	assert.equal(fs.existsSync(stale), false, "a directory no live call can hold is removed");
+	assert.equal(fs.existsSync(live), true, "a directory a live session may still use is kept");
+	guard.dispose();
+});
+
+test("no temporary directory survives a snapshot, a settle and a dispose", async (t) => {
+	if (!hasGit()) return t.skip("git is not available");
+	const directory = createGitRepository();
+	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+	const previousMode = process.env.PI_PLAN_GUARD;
+	t.after(() => {
+		if (previousMode === undefined) delete process.env.PI_PLAN_GUARD;
+		else process.env.PI_PLAN_GUARD = previousMode;
+	});
+	for (const mode of ["off", "detect", "full"]) {
+		const baseline = guardTempDirectories();
+		process.env.PI_PLAN_GUARD = mode;
+		const guard = createPlanGuard(directory);
+		const handle = await guard.begin();
+		fs.writeFileSync(path.join(directory, "written.txt"), "written\n");
+		await handle.settle();
+		const created = [...guardTempDirectories()].filter((name) => !baseline.has(name));
+		if (mode === "off") {
+			assert.deepEqual(created, [], "off mode never creates a directory");
+		} else {
+			assert.equal(created.length, 1, `${mode} mode creates exactly one working directory`);
+			const workingDirectory = created[0];
+			assert.ok(workingDirectory);
+			assert.deepEqual(
+				fs.readdirSync(path.join(os.tmpdir(), workingDirectory)),
+				[],
+				`${mode} mode removes its index files when the settle ends`,
+			);
+		}
+		guard.dispose();
+		assert.deepEqual(
+			[...guardTempDirectories()].filter((name) => !baseline.has(name)),
+			[],
+			`dispose() removes the working directory in ${mode} mode`,
+		);
+		fs.rmSync(path.join(directory, "written.txt"), { force: true });
+	}
+});
