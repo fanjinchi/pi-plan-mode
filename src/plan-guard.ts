@@ -83,8 +83,15 @@ const MODE_MAP_LIMIT = 20000;
 const MODE_TYPE_MASK = 0o170000;
 const MODE_FILE_TYPE = 0o100000;
 const MODE_PERMISSION_MASK = 0o7777;
-/** No live guarded call holds its working directory for an hour. */
+/** No live guarded call holds its working directory for an hour: a call holds it for one command. */
 const STALE_DIRECTORY_MS = 60 * 60 * 1000;
+/**
+ * Working directories belong to one process each, and their name carries that pid. A name
+ * without one comes from an older layout and is only removed once it is far older than any
+ * plausible session.
+ */
+const ANCIENT_DIRECTORY_MS = 24 * 60 * 60 * 1000;
+const DIRECTORY_PREFIX = "pi-plan-guard-";
 
 /**
  * Directories the fallback snapshot does not descend into. They are either VCS
@@ -114,6 +121,15 @@ export function resolveGuardMode(value: string | undefined): GuardMode {
 	if (normalized === "off") return "off";
 	if (normalized === "detect") return "detect";
 	return "full";
+}
+
+/**
+ * `PI_PLAN_GUARD_MODES=off` skips the per-call permission-bit map, which costs one lstat
+ * per snapshot path. It exists for large work trees: without the map a rollback falls back
+ * to git's own 100644/100755, and a plain `chmod` is neither detected nor reversed.
+ */
+export function planGuardModesEnabled(value: string | undefined): boolean {
+	return value?.trim().toLowerCase() !== "off";
 }
 
 type CommandResult = { code: number; stdout: string; stderr: string; spawnFailed: boolean };
@@ -193,11 +209,14 @@ interface FileEntry {
 interface FileSnapshot {
 	entries: Map<string, FileEntry>;
 	notes: string[];
+	/** Directories whose contents could not be read: the paths below them were never compared. */
+	unreadable: Set<string>;
 }
 
 function captureFileSnapshot(root: string): FileSnapshot {
 	const entries = new Map<string, FileEntry>();
 	const notes: string[] = [];
+	const unreadable = new Set<string>();
 	let contentBytes = 0;
 	const stack = [root];
 	let truncated = false;
@@ -208,6 +227,9 @@ function captureFileSnapshot(root: string): FileSnapshot {
 		try {
 			children = fs.readdirSync(directory, { withFileTypes: true });
 		} catch (error) {
+			// Distinguish "cannot look inside" from "the directory is gone": a later comparison
+			// must not read the contents it never saw as deleted.
+			unreadable.add(directory);
 			notes.push(`Could not read ${directory}: ${errorMessage(error)}`);
 			continue;
 		}
@@ -271,7 +293,15 @@ function captureFileSnapshot(root: string): FileSnapshot {
 			`Only the first ${ENTRY_LIMIT} entries were snapshotted; the rest of the tree is unprotected.`,
 		);
 	}
-	return { entries, notes };
+	return { entries, notes, unreadable };
+}
+
+/** The unreadable directory a path lives in, if the snapshot never saw what is below it. */
+function unreadableParent(snapshot: FileSnapshot, absolute: string): string | undefined {
+	for (const directory of snapshot.unreadable) {
+		if (absolute === directory || absolute.startsWith(`${directory}${path.sep}`)) return directory;
+	}
+	return undefined;
 }
 
 function fileContentChanged(before: FileEntry, after: FileEntry): boolean {
@@ -385,7 +415,7 @@ async function gitCapture(
 	root: string,
 	indexFile: string,
 	seed?: string,
-): Promise<string | undefined> {
+): Promise<{ tree: string; note?: string } | undefined> {
 	if (seed !== undefined) {
 		// Seed from an existing index so `git add` can reuse its stat cache and only hash
 		// files that actually changed. Without a seed every file in the repository is
@@ -402,7 +432,17 @@ async function gitCapture(
 	const written = await gitRun(root, ["write-tree"], env);
 	if (written.code !== 0) return undefined;
 	const tree = written.stdout.trim();
-	return tree.length > 0 ? tree : undefined;
+	if (tree.length === 0) return undefined;
+	// `git add` exits 0 while writing warnings for whatever it could not read (an unreadable
+	// directory, for instance), which makes the snapshot silently incomplete. The exit code
+	// is all git tells us about success, so the first warning line is the one usable signal.
+	const warning = added.stderr
+		.split("\n")
+		.map((line) => line.trim())
+		.find((line) => line.length > 0);
+	return warning === undefined
+		? { tree }
+		: { tree, note: `The snapshot may be incomplete: ${warning}` };
 }
 
 async function gitUserIndexPath(root: string): Promise<string | undefined> {
@@ -536,10 +576,33 @@ function permissionOnlyPaths(
 	return moved;
 }
 
+/** The pid recorded in a working directory's name, when the name carries one. */
+function directoryOwner(name: string): number | undefined {
+	const match = /^pi-plan-guard-(\d+)-/.exec(name);
+	if (match === null || match[1] === undefined) return undefined;
+	const pid = Number(match[1]);
+	return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+/** `EPERM` means the process exists but belongs to someone else: still alive. */
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+}
+
 /**
- * A session that is killed cannot remove its own working directory, so creating a guard
- * also drops directories old enough that no live call can still hold them (a guarded call
- * keeps its directory for the duration of one command, not for an hour).
+ * A killed session cannot remove its own working directory, so creating a guard also drops
+ * directories that are old enough to be debris *and* whose owner is provably gone. Age alone
+ * is the wrong test: an idle session holds its directory for as long as it lives, and
+ * deleting it would take that session's guard down with it. So the pid in the name decides —
+ * a live pid (including one this process may not signal) keeps its directory, and a name
+ * without a pid is only removed once it is far older than any session. A pid recycled by an
+ * unrelated process keeps a dead directory around, which is the safe failure: leaving
+ * garbage beats deleting a live guard's state.
  */
 function sweepStaleDirectories(): void {
 	let names: string[];
@@ -550,11 +613,20 @@ function sweepStaleDirectories(): void {
 	}
 	const now = Date.now();
 	for (const name of names) {
-		if (!name.startsWith("pi-plan-guard-")) continue;
+		if (!name.startsWith(DIRECTORY_PREFIX)) continue;
 		const candidate = path.join(os.tmpdir(), name);
+		const owner = directoryOwner(name);
 		try {
 			const stat = fs.statSync(candidate);
-			if (!stat.isDirectory() || now - stat.mtimeMs < STALE_DIRECTORY_MS) continue;
+			if (!stat.isDirectory()) continue;
+			if (owner === undefined) {
+				if (now - stat.mtimeMs >= ANCIENT_DIRECTORY_MS) {
+					fs.rmSync(candidate, { recursive: true, force: true });
+				}
+				continue;
+			}
+			if (now - stat.mtimeMs < STALE_DIRECTORY_MS) continue;
+			if (processAlive(owner)) continue;
 			fs.rmSync(candidate, { recursive: true, force: true });
 		} catch {
 			// Another session may have removed it first, or it is not ours to remove.
@@ -567,15 +639,40 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 	let settleChain: Promise<unknown> = Promise.resolve();
 	let sequence = 0;
 	let disposed = false;
+	/** Set when something removed the working directory underneath this guard. */
+	let directoryNote: string | undefined;
 	sweepStaleDirectories();
 
+	/**
+	 * The pid in the name lets a test, or a user staring at /tmp, tell which session a
+	 * leftover directory belongs to. A guard that lost its directory (a sweep from an older
+	 * version, a user emptying /tmp) recreates it here rather than failing every call for the
+	 * rest of the session: the directory is bookkeeping, not state worth dying over.
+	 */
 	function tempDirectory(): string {
-		if (temporaryDirectory === undefined) {
-			// The pid in the name lets a test, or a user staring at /tmp, tell which session a
-			// leftover directory belongs to.
-			temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), `pi-plan-guard-${process.pid}-`));
+		if (temporaryDirectory !== undefined) {
+			try {
+				if (fs.statSync(temporaryDirectory).isDirectory()) return temporaryDirectory;
+			} catch {
+				// Gone: recreated below.
+			}
+		}
+		const previous = temporaryDirectory;
+		temporaryDirectory = fs.mkdtempSync(
+			path.join(os.tmpdir(), `${DIRECTORY_PREFIX}${process.pid}-`),
+		);
+		if (previous !== undefined) {
+			directoryNote = `The guard's working directory ${previous} disappeared; ${temporaryDirectory} replaced it for this call.`;
 		}
 		return temporaryDirectory;
+	}
+
+	/** Reported by the next settle, once: this describes an event, not the call it lands in. */
+	function takeDirectoryNote(): string[] {
+		if (directoryNote === undefined) return [];
+		const note = directoryNote;
+		directoryNote = undefined;
+		return [note];
 	}
 
 	/**
@@ -772,8 +869,15 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 									});
 								}
 							}
+							const unverified: string[] = [];
 							for (const [absolute, entry] of snapshot.entries) {
 								if (after.entries.has(absolute)) continue;
+								// A directory that could not be read after the call hides whatever is below it:
+								// those paths are unverified, not deleted.
+								if (unreadableParent(after, absolute) !== undefined) {
+									unverified.push(absolute);
+									continue;
+								}
 								changes.push({
 									path: absolute,
 									kind: "deleted",
@@ -783,6 +887,7 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 							// Notes from the re-read matter as much as the snapshot's: a subtree that could
 							// not be read after the call was never compared, and silence would claim it was.
 							const notes = [
+								...takeDirectoryNote(),
 								...snapshot.notes,
 								...after.notes.map((note) => `After the call: ${note}`),
 							];
@@ -793,6 +898,9 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 								after,
 								changes,
 							);
+							for (const path of unverified) {
+								if (!unrestorable.includes(path)) unrestorable.push(path);
+							}
 							for (const note of snapshot.notes) {
 								if (!notes.includes(note)) notes.push(note);
 							}
@@ -808,20 +916,28 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 				return {
 					settle: async () =>
 						emptySettlement(mode, [
+							...takeDirectoryNote(),
 							`Could not snapshot the git work tree at ${root}; this call was not guarded.`,
 						]),
 				};
 			}
+			const snapshotNotes = beforeTree.note === undefined ? [] : [beforeTree.note];
 			// The real permission bits live nowhere git can see them, so they are read here,
 			// before the command runs (see captureWorkTreeModes).
-			const modes = await captureWorkTreeModes(root, indexFile);
+			const modes = planGuardModesEnabled(process.env.PI_PLAN_GUARD_MODES)
+				? await captureWorkTreeModes(root, indexFile)
+				: { modes: new Map<string, number>() };
 			return {
 				settle: async () =>
 					withSettleLock(async () => {
 						await options.duringSettle?.();
 						const postIndex = allocateTempFile(`post-${sequence++}`);
 						const verifyIndex = allocateTempFile(`verify-${sequence++}`);
-						const notes: string[] = modes.note === undefined ? [] : [modes.note];
+						const notes: string[] = [
+							...snapshotNotes,
+							...takeDirectoryNote(),
+							...(modes.note === undefined ? [] : [modes.note]),
+						];
 						try {
 							const afterTree = await gitCapture(root, postIndex, indexFile);
 							if (afterTree === undefined) {
@@ -830,14 +946,17 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 									`Could not re-read the git work tree at ${root}; this call was not checked.`,
 								]);
 							}
-							const changed = await gitChangedPaths(root, beforeTree, afterTree);
+							if (afterTree.note !== undefined && !notes.includes(afterTree.note)) {
+								notes.push(afterTree.note);
+							}
+							const changed = await gitChangedPaths(root, beforeTree.tree, afterTree.tree);
 							if (changed === undefined) {
 								return emptySettlement(mode, [
 									...notes,
 									`Could not diff the git work tree at ${root}; this call was not checked.`,
 								]);
 							}
-							const beforeEntries = await gitTreeEntries(root, beforeTree);
+							const beforeEntries = await gitTreeEntries(root, beforeTree.tree);
 							const changes: GuardChange[] = [
 								...changed.map((change) => ({
 									path: change.path,
@@ -869,7 +988,7 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 							}
 							const restoral = await gitRestore(
 								root,
-								beforeTree,
+								beforeTree.tree,
 								beforeEntries ?? new Map(),
 								changes,
 								modes.modes,
@@ -878,8 +997,15 @@ export function createPlanGuard(cwd: string, options: PlanGuardOptions = {}): Pl
 							// Re-read once to prove the work tree matches the snapshot again; a
 							// guard that claims to have restored and did not is worse than no guard.
 							const verifiedTree = await gitCapture(root, verifyIndex, postIndex);
-							if (verifiedTree !== undefined && verifiedTree !== beforeTree) {
-								const remaining = await gitChangedPaths(root, beforeTree, verifiedTree);
+							if (
+								verifiedTree !== undefined &&
+								verifiedTree.note !== undefined &&
+								!notes.includes(verifiedTree.note)
+							) {
+								notes.push(verifiedTree.note);
+							}
+							if (verifiedTree !== undefined && verifiedTree.tree !== beforeTree.tree) {
+								const remaining = await gitChangedPaths(root, beforeTree.tree, verifiedTree.tree);
 								if (remaining !== undefined && remaining.length > 0) {
 									notes.push(
 										`${remaining.length} path(s) still differ from the snapshot after restoring.`,

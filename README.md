@@ -148,9 +148,9 @@ The guard is a second line, not a replacement: it sees file system changes only 
 - Restores the **pre-call** state: your uncommitted edits and untracked files come back with their own content instead of being reset to `HEAD`.
 - Never touches your staging area — snapshots run through the guard's own temporary index.
 - Serializes compare-and-restore: rollbacks never interleave. Calls in one batch still overlap, so the rollback of one call can run while a sibling call is still executing. The snapshots themselves are taken during preflight (pi preflights every sibling tool call before executing any sibling), which is what keeps a batch of two shell calls from deadlocking.
-- Cleans up: temporary indexes are removed as soon as a call settles, and everything left over is removed on session shutdown — a tool result that never arrives is dropped at session shutdown. Directories left behind by a killed process are tagged with their process id and swept once they are older than an hour.
+- Cleans up: temporary indexes are removed as soon as a call settles, and everything left over is removed on session shutdown — a tool result that never arrives is dropped, but its snapshot stays on disk until the session ends. A working directory whose session died cannot be removed by that session, so starting a guard also sweeps directories that are both an hour old and owned by a pid that no longer exists; an idle session keeps its own directory, and a directory that disappears is recreated on the next call.
 
-Without git (no repository, or git missing) the guard falls back to an in-process content snapshot of the working directory: files up to 1 MiB, 32 MiB in total, at most 20000 entries. Paths outside that budget are still detected and reported as unrestorable, never silently ignored.
+Without git (no repository, or git missing) the guard falls back to an in-process content snapshot of the working directory: files up to 1 MiB, 32 MiB in total, at most 20000 entries. A path outside that budget is still detected (its content is compared one entry at a time) and reported as unrestorable rather than ignored, but the 20000-entry limit itself is all-or-nothing: above it the call gets no permission-mode verification at all for any path, with a note saying so.
 
 ### Configuration
 
@@ -164,17 +164,20 @@ Without git (no repository, or git missing) the guard falls back to an in-proces
 
 Any other value, a typo included, keeps `full`.
 
+`PI_PLAN_GUARD_MODES=off` (any other value, a typo included, leaves the map on) skips the permission-mode map. That map is what turns a bare `chmod` into a reported, restored change, and it is the most expensive part of the snapshot: on a ~20k-file work tree it costs roughly 60 ms per guarded call. Turning it off trades that away — content changes are still detected and rolled back, a `chmod` that changes nothing else is neither detected nor restored, and no note is produced about the missing map.
+
 ### Honest limits
 
 - **File system only.** Network requests, spawned background processes, and anything a child process did while it ran are not reverted.
 - **Only calls the judge allowed.** A blocked command never runs, so there is nothing to verify; `edit`/`write` are restricted statically to `pi_plan.md` instead.
 - **Gitignored files are invisible** to the git backend: they are neither detected nor restored. The same holds for paths outside the work tree above the working directory (a command can write to `/tmp`), for files marked `assume-unchanged` or `skip-worktree`, and for anything inside `.git/` itself. The fallback snapshot skips the usual VCS and dependency directories for the same reason.
 - **Directories are not tracked.** git does not record empty directories, so creating or deleting one is not reported and a directory a call removed is not recreated.
-- **Permissions** are restored from what the guard captured when the call started: content plus permission bits, execute bit included, applied without the umask of the current process, so a `chmod` that changes nothing else is reported as a permission-only change. Modes of paths the guard never captured — a file the call created, or any path beyond the 20000-entry mode map — are not restored.
+- **Permissions** are restored for **files** from what the guard captured when the call started: content plus permission bits, execute bit included, applied without the umask of the current process, so a `chmod` that changes nothing else is reported as a permission-only change. Modes of paths the guard never captured — a file the call created, or any path beyond the 20000-entry mode map — are not restored. **Directory permissions are never captured or restored**: `chmod 777 <dir>` is invisible to the guard, and a directory that becomes unreadable can make a git snapshot incomplete.
+- **A git snapshot is judged by `git add -A`'s exit code.** Git can stage an incomplete tree while still exiting 0 (an unreadable directory is one such case), so a snapshot can be missing something without a note about it. When `git add -A` writes to stderr, its first line is reported as a note, which covers most of these cases but is not a guarantee. In the fallback backend an unreadable directory is reported as unverified instead of being mistaken for a deletion.
 - **Repository filters run.** Snapshotting stages the work tree through a temporary index and restoring reads it back, so configured `clean`/`smudge` filters (like the `diff` textconv programs in the judge above) execute as part of the guard's own bookkeeping. A filter that writes files is a write the guard cannot tell apart from the command's own.
 - **Not a backup.** The fallback budget leaves large files detect-only, and submodule (gitlink) paths cannot be restored.
 - **Manual edits race with a rollback.** Editing a file by hand while a guarded command runs can be overwritten by the rollback; that case is not detected.
-- **Cost.** Each guarded call stages the whole work tree into a temporary index, and the snapshots leave unreferenced blobs in `.git/objects` until git's own garbage collection removes them.
+- **Cost.** Each guarded call stages the whole work tree into a temporary index, and the snapshots leave unreferenced blobs in `.git/objects` until git's own garbage collection removes them. The unconditional part is the permission-mode map: in a synthetic ~19.9k-file repository the median guarded call went from ~28 ms to ~93 ms while starting and from ~46 ms to ~103 ms while settling, so budget roughly +60 ms per guarded call (`git ls-files -z` ~6 ms, ~20k `lstat` calls ~61 ms, `git add -A` + `write-tree` ~22 ms); a work tree over the 20000-entry limit skips the map and pays only the git part. `PI_PLAN_GUARD_MODES=off` removes that tax at the cost described above.
 
 ## 🗂️ Package layout
 

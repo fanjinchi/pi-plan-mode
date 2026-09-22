@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,6 +20,20 @@ function changedNames(
 
 function guardTempDirectories(): Set<string> {
 	return new Set(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("pi-plan-guard-")));
+}
+
+/** A pid that belongs to no process: the only case where an old directory is provably debris. */
+function exitedPid(): number | undefined {
+	for (let attempt = 0; attempt < 5; attempt++) {
+		const pid = spawnSync(process.execPath, ["-e", "0"], { stdio: "ignore" }).pid;
+		if (pid === undefined || pid <= 0) continue;
+		try {
+			process.kill(pid, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") return pid;
+		}
+	}
+	return undefined;
 }
 
 test("resolveGuardMode defaults to full and is not switched off by a typo", () => {
@@ -340,20 +355,169 @@ test("without git the content snapshot restores permission bits too", async (t) 
 	guard.dispose();
 });
 
-test("a stale guard directory is swept while a live one is left alone", async (t) => {
+test("the sweep removes only directories whose owner is gone", async (t) => {
 	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "plan-guard-sweep-"));
 	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-	const stale = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plan-guard-stale-"));
-	const live = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plan-guard-live-"));
-	t.after(() => fs.rmSync(live, { recursive: true, force: true }));
-	fs.writeFileSync(path.join(stale, "pre-0.index"), "debris from a killed session");
-	const longAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
-	fs.utimesSync(stale, longAgo, longAgo);
+	const hoursAgo = (hours: number): Date => new Date(Date.now() - hours * 60 * 60 * 1000);
+	const makeDirectory = (prefix: string, age: Date): string => {
+		const created = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+		fs.writeFileSync(path.join(created, "pre-0.index"), "debris from a killed session");
+		fs.utimesSync(created, age, age);
+		t.after(() => fs.rmSync(created, { recursive: true, force: true }));
+		return created;
+	};
+	const deadPid = exitedPid();
+	if (deadPid === undefined) return t.skip("could not observe an exited pid");
+	// A live session holds its directory for as long as it lives, however old it gets: an
+	// mtime says nothing about whether the owner is still working.
+	const own = makeDirectory(`pi-plan-guard-${process.pid}-`, hoursAgo(2));
+	const foreign = makeDirectory(`pi-plan-guard-${process.ppid}-`, hoursAgo(2));
+	const dead = makeDirectory(`pi-plan-guard-${deadPid}-`, hoursAgo(2));
+	const deadAndFresh = makeDirectory(`pi-plan-guard-${deadPid}-`, hoursAgo(0));
+	// Names from the older layout carry no pid, so only the far larger threshold applies.
+	const pidlessRecent = makeDirectory("pi-plan-guard-old-layout-", hoursAgo(2));
+	const pidlessAncient = makeDirectory("pi-plan-guard-old-layout-", hoursAgo(25));
 
 	const guard = createPlanGuard(directory);
-	assert.equal(fs.existsSync(stale), false, "a directory no live call can hold is removed");
-	assert.equal(fs.existsSync(live), true, "a directory a live session may still use is kept");
+	assert.equal(fs.existsSync(own), true, "a live guard's directory survives the sweep");
+	assert.equal(fs.existsSync(foreign), true, "a live pid this process may not signal survives too");
+	assert.equal(fs.existsSync(dead), false, "a directory whose owner exited is removed");
+	assert.equal(fs.existsSync(deadAndFresh), true, "but not before it is old enough to be debris");
+	assert.equal(fs.existsSync(pidlessRecent), true, "a pid-less name is not removed on age alone");
+	assert.equal(
+		fs.existsSync(pidlessAncient),
+		false,
+		"a pid-less name is removed once it is ancient",
+	);
 	guard.dispose();
+});
+
+test("a guard whose working directory disappears recreates it and keeps guarding", async (t) => {
+	if (!hasGit()) return t.skip("git is not available");
+	const directory = createGitRepository();
+	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+	withGuardMode(t, "full");
+	const guard = createPlanGuard(directory);
+	t.after(() => guard.dispose());
+
+	const first = await guard.begin();
+	await first.settle();
+	const workingDirectory = fs
+		.readdirSync(os.tmpdir())
+		.find((name) => name.startsWith(`pi-plan-guard-${process.pid}-`));
+	assert.ok(workingDirectory !== undefined, "the first call allocated a working directory");
+	fs.rmSync(path.join(os.tmpdir(), workingDirectory), { recursive: true, force: true });
+
+	// Everything after this has to keep working: a guard that fails for the rest of the
+	// session because one directory was removed is worse than no guard at all.
+	const second = await guard.begin();
+	fs.writeFileSync(path.join(directory, "written.txt"), "command wrote\n");
+	const settlement = await second.settle();
+	assert.equal(changedNames(settlement).get("written.txt")?.kind, "created");
+	assert.equal(
+		fs.existsSync(path.join(directory, "written.txt")),
+		false,
+		"the write is still detected and rolled back",
+	);
+	assert.equal(settlement.notes.length, 1, "the missing directory is reported exactly once");
+	assert.match(settlement.notes[0] ?? "", /working directory .* disappeared/);
+
+	const third = await guard.begin();
+	fs.writeFileSync(path.join(directory, "written.txt"), "again\n");
+	const thirdSettlement = await third.settle();
+	assert.equal(changedNames(thirdSettlement).get("written.txt")?.kind, "created");
+	assert.deepEqual(thirdSettlement.notes, [], "and the note does not repeat on every later call");
+});
+
+test("a directory that cannot be read after the call is unverified, not deleted", async (t) => {
+	if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "plan-guard-unreadable-"));
+	const sealed = path.join(directory, "sealed");
+	fs.mkdirSync(sealed);
+	fs.writeFileSync(path.join(sealed, "inside.txt"), "inside\n");
+	fs.writeFileSync(path.join(directory, "gone.txt"), "gone\n");
+	t.after(() => {
+		try {
+			fs.chmodSync(sealed, 0o700);
+		} catch {
+			// Already removed with the rest of the fixture.
+		}
+		fs.rmSync(directory, { recursive: true, force: true });
+	});
+	// No repository, so this exercises the content snapshot and its comparison.
+	withGuardMode(t, "full");
+	const guard = createPlanGuard(directory);
+	t.after(() => guard.dispose());
+
+	const handle = await guard.begin();
+	fs.chmodSync(sealed, 0o000);
+	fs.rmSync(path.join(directory, "gone.txt"));
+	const settlement = await handle.settle();
+	fs.chmodSync(sealed, 0o700);
+
+	const changes = changedNames(settlement);
+	assert.equal(changes.get("gone.txt")?.kind, "deleted", "a real deletion is still reported");
+	assert.equal(changes.get("inside.txt"), undefined, "an unreadable directory is not a deletion");
+	assert.ok(
+		settlement.unrestorable.some((entry) => entry.endsWith("inside.txt")),
+		"its contents are reported as unverified instead",
+	);
+	assert.ok(
+		settlement.notes.some((note) => /After the call: Could not read .*sealed/.test(note)),
+		"and the note says which directory could not be read",
+	);
+	assert.equal(
+		fs.readFileSync(path.join(directory, "gone.txt"), "utf8"),
+		"gone\n",
+		"the deletion is still undone",
+	);
+});
+
+test("an ordinary call in a clean repository produces no notes at all", async (t) => {
+	if (!hasGit()) return t.skip("git is not available");
+	const directory = createGitRepository();
+	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+	withGuardMode(t, "full");
+	const guard = createPlanGuard(directory);
+	t.after(() => guard.dispose());
+
+	const handle = await guard.begin();
+	const settlement = await handle.settle();
+	assert.deepEqual(settlement.changes, []);
+	assert.deepEqual(
+		settlement.notes,
+		[],
+		"watching git's stderr must not turn a quiet snapshot into a note",
+	);
+});
+
+test("PI_PLAN_GUARD_MODES=off skips the permission map and nothing else", async (t) => {
+	if (!hasGit()) return t.skip("git is not available");
+	const directory = createGitRepository();
+	t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+	const previous = process.env.PI_PLAN_GUARD_MODES;
+	t.after(() => {
+		if (previous === undefined) delete process.env.PI_PLAN_GUARD_MODES;
+		else process.env.PI_PLAN_GUARD_MODES = previous;
+	});
+	withGuardMode(t, "full");
+	process.env.PI_PLAN_GUARD_MODES = "off";
+	const guard = createPlanGuard(directory);
+	t.after(() => guard.dispose());
+
+	const handle = await guard.begin();
+	fs.chmodSync(path.join(directory, "tracked.txt"), 0o600);
+	fs.writeFileSync(path.join(directory, "written.txt"), "written\n");
+	const settlement = await handle.settle();
+	const changes = changedNames(settlement);
+	assert.equal(changes.get("written.txt")?.kind, "created", "content changes are still caught");
+	assert.equal(
+		changes.get("tracked.txt"),
+		undefined,
+		"without the map a bare chmod is invisible, which is what the switch trades away",
+	);
+	assert.deepEqual(settlement.notes, [], "and the missing map is not reported as a failure");
+	assert.equal(fs.existsSync(path.join(directory, "written.txt")), false);
 });
 
 test("no temporary directory survives a snapshot, a settle and a dispose", async (t) => {
